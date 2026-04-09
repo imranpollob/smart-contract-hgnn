@@ -6,9 +6,69 @@ Each step ends with a verification checklist — all items must pass before movi
 
 ---
 
+## Step 0 — Project Setup
+**Output:** Directory structure, `requirements.txt`, `ARCHITECTURE.md`
+
+### Task
+Create the project skeleton and install dependencies.
+
+### Directory Structure
+```
+smart-contract-hgnn/
+├── CLAUDE.md
+├── PLAN.md
+├── ARCHITECTURE.md
+├── Hypergraph_Analysis.tex
+├── requirements.txt
+├── data/
+│   ├── reentrancy-detection-benchmarks/   ← Repo 1 (already cloned)
+│   └── manually-verified-reentrancy-dataset/  ← Repo 2 (already cloned)
+├── src/
+│   ├── __init__.py
+│   ├── extraction/
+│   │   ├── __init__.py
+│   │   ├── ast_cfg.py          ← Step 1
+│   │   └── gdep.py             ← Step 2
+│   ├── hypergraph/
+│   │   ├── __init__.py
+│   │   ├── nodeset.py          ← Step 3
+│   │   ├── features.py         ← Step 4
+│   │   └── hyperedges.py       ← Step 5
+│   ├── model/
+│   │   ├── __init__.py
+│   │   └── hgnn.py             ← Step 6
+│   └── evaluation/
+│       ├── __init__.py
+│       ├── train.py            ← Step 7
+│       ├── baselines.py        ← Step 7.5
+│       ├── final_eval.py       ← Step 8
+│       ├── ablation.py         ← Step 9
+│       └── case_study.py       ← Step 10
+├── scripts/
+├── tests/
+│   ├── __init__.py
+│   ├── test_extraction.py
+│   ├── test_gdep.py
+│   ├── test_nodeset.py
+│   ├── test_features.py
+│   ├── test_hyperedges.py
+│   └── test_hgnn.py
+├── checkpoints/
+├── results/
+└── feature_config.json
+```
+
+### Verification Checklist
+- [ ] All directories exist
+- [ ] `requirements.txt` lists all dependencies
+- [ ] `ARCHITECTURE.md` created with all components at ⏳ Pending
+
+---
+
 ## Step 1 — AST, CFG, Call Graph Extraction
 **Spec reference:** Section 3.2 (Program Representation Layer)
-**Output file:** `step1_ast_cfg.py`
+**Output file:** `src/extraction/ast_cfg.py`
+**Test file:** `tests/test_extraction.py`
 
 ### Task
 Parse a Solidity contract and extract:
@@ -28,6 +88,7 @@ Parse a Solidity contract and extract:
 - Use `solc-select` to match the pragma version of each contract automatically
 - `G_call` nodes must match the function names that will become `V_f` in Step 3
 - Store `G_call` as a NetworkX DiGraph — nodes are string function names
+- Wrap all Slither/solc calls in try-except; log failures, do not crash the pipeline
 
 ### Verification Checklist
 - [ ] AST parses successfully for the `withdraw` example contract
@@ -39,7 +100,8 @@ Parse a Solidity contract and extract:
 
 ## Step 2 — Data Dependency Graph ($G_{dep}$)
 **Spec reference:** Section 3.2 and Section 4.4.2
-**Output file:** `step2_gdep.py`
+**Output file:** `src/extraction/gdep.py`
+**Test file:** `tests/test_gdep.py`
 
 ### Task
 Build `G_dep: nx.DiGraph` — a bipartite graph where edge `(n, s)` exists if state variable `s` is read before or written after node `n` (where `n` is a call site or function).
@@ -65,7 +127,8 @@ Build `G_dep: nx.DiGraph` — a bipartite graph where edge `(n, s)` exists if st
 
 ## Step 3 — Node Set Construction ($\mathcal{V}$)
 **Spec reference:** Section 4.2 (Node Set)
-**Output file:** `step3_nodeset.py`
+**Output file:** `src/hypergraph/nodeset.py`
+**Test file:** `tests/test_nodeset.py`
 
 ### Task
 Build the three disjoint node sets and combine into `V`.
@@ -98,7 +161,8 @@ Build the three disjoint node sets and combine into `V`.
 
 ## Step 4 — Node Feature Matrix ($X$)
 **Spec reference:** Section 4.3 (Node Features)
-**Output file:** `step4_features.py`
+**Output file:** `src/hypergraph/features.py`
+**Test file:** `tests/test_features.py`
 
 ### Task
 Compute feature vector `x_v ∈ R^d` for each node `v ∈ V` and assemble into matrix `X`.
@@ -130,7 +194,8 @@ Compute feature vector `x_v ∈ R^d` for each node `v ∈ V` and assemble into m
 
 ## Step 5 — Hyperedge Construction and Incidence Matrix ($\mathbf{H}$)
 **Spec reference:** Section 4.5–4.6 (Hyperedge Definition + Algorithm)
-**Output file:** `step5_hyperedges.py`
+**Output file:** `src/hypergraph/hyperedges.py`
+**Test file:** `tests/test_hyperedges.py`
 
 ### Task
 For each call site `c ∈ V_c`, construct hyperedge `e_c = {c} ∪ F(c) ∪ S(c)`.
@@ -145,8 +210,23 @@ Then build incidence matrix `H_inc`.
 - `H_inc: np.ndarray` of shape `(|V|, |E|)` — binary incidence matrix
 
 ### Implementation Notes
-- `F(c) = {f} ∪ Ancestors(f, G_call)` where `f` is the function containing `c`
-  - Use `nx.ancestors(G_call, f)` for ancestor lookup
+- `F(c) = {f} ∪ BoundedAncestors(f, G_call, delta)` where `f` is the function containing `c`
+  - **Use BFS with depth cutoff δ=3** (not unbounded `nx.ancestors()`). Implement as:
+    ```python
+    def bounded_ancestors(G, node, delta=3):
+        """Return ancestors of node reachable within delta hops via BFS."""
+        visited = set()
+        frontier = {node}
+        for _ in range(delta):
+            next_frontier = set()
+            for n in frontier:
+                for pred in G.predecessors(n):
+                    if pred not in visited:
+                        visited.add(pred)
+                        next_frontier.add(pred)
+            frontier = next_frontier
+        return visited
+    ```
 - `S(c) = {s ∈ V_s | (c, s) ∈ G_dep}`
 - `H_inc[i, j] = 1` if node `V[i]` is in hyperedge `E[j]`, else 0
 - Assert `len(E) == len(V_c)` — one hyperedge per call site
@@ -157,12 +237,14 @@ Then build incidence matrix `H_inc`.
 - [ ] `H_inc` contains only 0s and 1s
 - [ ] `len(E) == len(V_c)` — assertion in code
 - [ ] Every call site node `c` appears in exactly its own hyperedge
+- [ ] Ancestor expansion respects δ=3 bound
 
 ---
 
 ## Step 6 — HGNN Model
 **Spec reference:** Section 5 (Hypergraph Neural Network)
-**Output file:** `step6_hgnn.py`
+**Output file:** `src/model/hgnn.py`
+**Test file:** `tests/test_hgnn.py`
 
 ### Task
 Implement the HGNN as a PyTorch `nn.Module`.
@@ -196,6 +278,8 @@ Implement the HGNN as a PyTorch `nn.Module`.
 - `L` is a constructor argument, default = 2
 - LayerNorm is a constructor argument `use_layernorm: bool`, default = True
 - Handle `D_v[i,i] = 0` (isolated nodes) by setting inverse to 0
+- **Classifier uses softmax** (per paper Section 5.5): output is `[p(non-vulnerable), p(vulnerable)]`
+- **Loss: `nn.CrossEntropyLoss`** with class weights (not BCE)
 
 ### Verification Checklist
 - [ ] Forward pass runs without error on the `withdraw` example
@@ -208,20 +292,33 @@ Implement the HGNN as a PyTorch `nn.Module`.
 
 ## Step 7 — Training Loop and CV Evaluation
 **Spec reference:** Section 7 (Evaluation Plan)
-**Output file:** `step7_train.py`
+**Output file:** `src/evaluation/train.py`
 
 ### Task
-Implement the full training loop using the predefined 3-fold CV splits from `cv_splits.zip`.
+Implement the full training loop using 3-fold CV splits.
+
+### CV Split Generation
+There is no pre-existing `cv_splits.zip`. Generate splits programmatically using the same logic
+as `data/reentrancy-detection-benchmarks/scripts/make_folds.py`:
+```python
+from sklearn.model_selection import KFold
+
+# Collect contract filenames from:
+#   data/reentrancy-detection-benchmarks/benchmarks/aggregated-benchmark/src/reentrant/
+#   data/reentrancy-detection-benchmarks/benchmarks/aggregated-benchmark/src/safe/
+# Sort filenames for reproducibility.
+# Apply KFold(n_splits=3, shuffle=True, random_state=42) per class.
+```
 
 ### Inputs
-- `cv_splits.zip` from Repo 1 (`reentrancy-detection-benchmarks`)
-- Aggregated Benchmark contracts (436 contracts)
+- Aggregated Benchmark contracts (436 contracts) from Repo 1
+- CV splits generated as above
 
 ### Per-Fold Loop
 ```
 for fold in [1, 2, 3]:
-    load train/val contracts from cv_splits
-    build H_graph, H_inc, X, E, labels for each contract
+    generate train/val contract lists from KFold split
+    for each contract: run Steps 1-5 to build H_graph, H_inc, X, E, labels
     train HGNN for N epochs:
         forward pass → y_pred
         compute weighted cross-entropy loss
@@ -229,6 +326,12 @@ for fold in [1, 2, 3]:
     evaluate on val set → Precision, Recall, F1, FNR, FPR
 save metrics to results/fold_{fold}_metrics.csv
 ```
+
+### Label Assignment
+Labels are at the contract level (directory: `reentrant/` vs `safe/`).
+Map to hyperedge labels using the rule from spec Section 6.2:
+- For contracts in `reentrant/`: ALL hyperedges get `y_e = 1`
+- For contracts in `safe/`: ALL hyperedges get `y_e = 0`
 
 ### Class Weights
 - Reentrant (class 1) weight = `314 / 122 ≈ 2.57`
@@ -249,18 +352,63 @@ save metrics to results/fold_{fold}_metrics.csv
 
 ### Verification Checklist
 - [ ] Training loss decreases over epochs
-- [ ] CV splits loaded from `cv_splits.zip`, not generated manually
+- [ ] CV splits are generated deterministically (same filenames each run)
 - [ ] Metrics saved to `results/` per fold
 - [ ] 5-seed run completes and mean ± std is reported
 
 ---
 
+## Step 7.5 — Baselines
+**Spec reference:** Section 7.2 (Baselines)
+**Output file:** `src/evaluation/baselines.py`
+
+### Task
+Implement baseline comparisons to validate that the HGNN hypergraph approach adds value.
+
+### Baselines to Implement
+
+| Baseline | Description |
+|---|---|
+| **GCN** | Replace `H_inc` with a pairwise adjacency matrix derived from hyperedges (clique expansion). Same node features, same classifier head. Use PyTorch Geometric `GCNConv`. |
+| **GAT** | Same as GCN but with `GATConv`. |
+| **MLP** | Flatten hyperedge features (mean of member node features) → 2-layer MLP classifier. |
+| **Random Forest** | Same flattened features → sklearn `RandomForestClassifier`. |
+| **Static analysis tools** | Load pre-computed results from `data/reentrancy-detection-benchmarks/results/smartbugs/*.csv`. Parse tool predictions and compute metrics. |
+
+### Implementation Notes
+- GCN/GAT: use the same training loop, optimizer, and CV splits as Step 7
+- MLP/RF: use the same CV splits; train sklearn models on the same features
+- Tool baselines: parse existing CSV results, no re-running tools needed
+
+### Verification Checklist
+- [ ] All 5 baselines produce metrics on the same CV splits
+- [ ] Results saved to `results/baselines_*.csv`
+
+---
+
 ## Step 8 — Final Held-Out Evaluation (Repo 2)
 **Spec reference:** Section 7.1 (Secondary Dataset)
-**Output file:** `step8_final_eval.py`
+**Output file:** `src/evaluation/final_eval.py`
 
 ### Task
 Evaluate the best trained model (highest val F1 across folds/seeds) on the held-out test set from `manually-verified-reentrancy-dataset`.
+
+### Label Mapping for Secondary Dataset
+The secondary dataset organizes contracts by category, not binary labels.
+Map directory structure to labels:
+
+```
+dataset/0_8/always-safe/*           → label 0
+dataset/0_8/cross-contract/*        → label 1
+dataset/0_8/cross-function/*        → label 1
+dataset/0_8/single-function/*       → label 1
+
+dataset/0_4/always-safe/*           → label 0
+dataset/0_4/{other categories}/*    → label 1
+
+dataset/0_5/always-safe/*           → label 0
+dataset/0_5/{other categories}/*    → label 1
+```
 
 ### Rules
 - Load weights from the best checkpoint saved in Step 7
@@ -273,6 +421,7 @@ Evaluate the best trained model (highest val F1 across folds/seeds) on the held-
 
 ### Verification Checklist
 - [ ] Model is loaded from checkpoint, not retrained
+- [ ] Label mapping from directory categories is correct
 - [ ] Metrics are saved to `results/`
 - [ ] Predictions are mapped back to source lines for localization
 
@@ -280,15 +429,15 @@ Evaluate the best trained model (highest val F1 across folds/seeds) on the held-
 
 ## Step 9 — Ablation Studies
 **Spec reference:** Section 7.4 (Ablation Study)
-**Output file:** `step9_ablation.py`
+**Output file:** `src/evaluation/ablation.py`
 
 Run 5 controlled ablations, each as a separate training run on the Aggregated Benchmark (same CV splits):
 
 | Ablation | What to change |
 |---|---|
-| A1: Hypergraph → Graph | Replace `H_inc` with a standard pairwise adjacency matrix |
+| A1: Hypergraph → Graph | Replace `H_inc` with a standard pairwise adjacency matrix (clique expansion of hyperedges) |
 | A2: Remove S(c) | Set `S_c = set()` in Step 5; rebuild `H_inc` |
-| A3: Remove F(c) ancestors | Set `F_c = {f}` only (no `nx.ancestors`); rebuild `H_inc` |
+| A3: Remove F(c) ancestors | Set `F_c = {f}` only (no ancestor expansion); rebuild `H_inc` |
 | A4: No residual connections | Remove `X = X + X_new` in HGNN forward pass |
 | A5: Depth sensitivity | Train with `L ∈ {1, 2, 3, 4}`; plot F1 vs L |
 
@@ -303,7 +452,7 @@ Save all ablation results to `results/ablation_*.csv`.
 
 ## Step 10 — Case Study and Localization
 **Spec reference:** Section 7.5 (Case Study)
-**Output file:** `step10_case_study.py`
+**Output file:** `src/evaluation/case_study.py`
 
 ### Task
 Select one contract from Repo 2 with a confirmed reentrancy vulnerability. For the predicted vulnerable hyperedge, show:
@@ -319,38 +468,3 @@ Select one contract from Repo 2 with a confirmed reentrancy vulnerability. For t
 - [ ] At least one contract with a vulnerable prediction is shown
 - [ ] Source line mapping is accurate (verify against the `.sol` file manually)
 - [ ] Report is saved to `results/case_study.txt`
-
----
-
-## File Structure (target)
-
-```
-project/
-├── CLAUDE.md
-├── PLAN.md
-├── Hypergraph_Analysis.tex
-├── data/
-│   ├── reentrancy-detection-benchmarks/   ← Repo 1 (cloned)
-│   └── manually-verified-reentrancy-dataset/  ← Repo 2 (cloned)
-├── step1_ast_cfg.py
-├── step2_gdep.py
-├── step3_nodeset.py
-├── step4_features.py
-├── step5_hyperedges.py
-├── step6_hgnn.py
-├── step7_train.py
-├── step8_final_eval.py
-├── step9_ablation.py
-├── step10_case_study.py
-├── feature_config.json
-├── checkpoints/
-│   └── best_model.pt
-└── results/
-    ├── fold_1_metrics.csv
-    ├── fold_2_metrics.csv
-    ├── fold_3_metrics.csv
-    ├── final_eval_metrics.csv
-    ├── final_eval_predictions.csv
-    ├── ablation_A1.csv ... ablation_A5.csv
-    └── case_study.txt
-```

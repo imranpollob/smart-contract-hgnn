@@ -53,8 +53,8 @@ Follow these exactly as specified in `Hypergraph_Analysis.tex`:
 2. **Hyperedge formula:** `e_c = {c} ∪ F_c ∪ S_c` (Section 4.5 of spec).
 3. **HGNN propagation uses residual connections** — the base formula without residual is for reference only. Always implement the residual version.
 4. **Hyperedge embedding = mean pooling** over member node embeddings — no attention, no max pooling.
-5. **Classifier = linear layer + softmax** — output shape is `[2]` per hyperedge (non-vulnerable, vulnerable).
-6. **Loss = cross-entropy** with class weighting to handle 1:2.6 imbalance (122 reentrant / 314 safe).
+5. **Classifier = linear layer + softmax over 2 classes** — output shape is `[2]` per hyperedge `[p(non-vulnerable), p(vulnerable)]`.
+6. **Loss = `nn.CrossEntropyLoss`** with class weighting to handle 1:2.6 imbalance (122 reentrant / 314 safe).
 7. **L ∈ {2, 3, 4}** layers — make this a configurable hyperparameter, default = 2.
 
 ---
@@ -65,7 +65,7 @@ Follow these exactly as specified in `Hypergraph_Analysis.tex`:
 - URL: https://github.com/matteo-rizzo/reentrancy-detection-benchmarks
 - Aggregated Benchmark: 436 contracts (122 reentrant / 314 safe) in `/benchmarks/aggregated-benchmark/`
 - RS subset: 154 contracts in `/benchmarks/rs/` — used for ablation only
-- Predefined CV splits: `cv_splits.zip` — always use these, do not generate custom splits
+- CV splits: generate using `sklearn.model_selection.KFold(n_splits=3, shuffle=True, random_state=42)` per class, matching the logic in `scripts/make_folds.py`
 - AST generation: `scripts/source2ast.sh` (uses `solc`)
 - CFG generation: `scripts/source2cfg.py` (uses Slither)
 
@@ -92,7 +92,7 @@ Follow these exactly as specified in `Hypergraph_Analysis.tex`:
 
 ## Code Style
 
-- One file per step (matching PLAN.md step numbers), e.g., `step1_ast_cfg.py`, `step2_gdep.py`
+- Modules organized under `src/` subdirectories (see PLAN.md for file mapping)
 - Every function must have a docstring referencing the spec section it implements, e.g.:
   ```python
   def build_hyperedge(c, G_call, G_dep, V_s):
@@ -127,7 +127,7 @@ Follow these exactly as specified in `Hypergraph_Analysis.tex`:
 ## What NOT to Do
 
 - Do not use `torch_geometric.data.HeteroData` — the hypergraph structure is custom, built manually via `H_inc`.
-- Do not auto-generate the train/test split — always load from `cv_splits.zip`.
+- Do not use random splits — always use `KFold(n_splits=3, shuffle=True, random_state=42)` for reproducibility.
 - Do not run Slither or `solc` on the held-out test set (Repo 2) during any training step.
 - Do not rename spec variables for style reasons.
 - Do not skip the worked example test at the end of each step.
