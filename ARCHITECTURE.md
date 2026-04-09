@@ -8,8 +8,8 @@
 
 | # | Component | File(s) | Status | Notes |
 |---|-----------|---------|--------|-------|
-| 0 | Project setup | `requirements.txt`, dirs | ⏳ Pending | |
-| 1 | AST, CFG, Call Graph extraction | `src/extraction/ast_cfg.py` | ⏳ Pending | |
+| 0 | Project setup | `pyproject.toml`, dirs | ✅ Done | Using uv as package manager |
+| 1 | AST, CFG, Call Graph extraction | `src/extraction/ast_cfg.py` | ✅ Done | 25 tests passing; uses Slither IR for call detection |
 | 2 | Data Dependency Graph (G_dep) | `src/extraction/gdep.py` | ⏳ Pending | |
 | 3 | Node Set Construction (V_f, V_s, V_c) | `src/hypergraph/nodeset.py` | ⏳ Pending | |
 | 4 | Node Feature Matrix (X) | `src/hypergraph/features.py` | ⏳ Pending | |
@@ -36,6 +36,8 @@
 | Date | What was done | Files touched |
 |------|---------------|---------------|
 | 2026-04-09 | Project review: verified feasibility, revised PLAN.md (7 fixes), updated CLAUDE.md, created ARCHITECTURE.md | PLAN.md, CLAUDE.md, ARCHITECTURE.md |
+| 2026-04-09 | Step 0: uv init, installed deps, created src/ dir structure | pyproject.toml, src/*/__init__.py |
+| 2026-04-09 | Step 1: AST/CFG/call graph extraction via Slither. Uses IR-level InternalCall for G_call edges. 25 tests. | src/extraction/ast_cfg.py, tests/test_extraction.py |
 
 ---
 

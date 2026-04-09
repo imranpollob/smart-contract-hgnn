@@ -1,0 +1,16 @@
+[project]
+name = "smart-contract-hgnn"
+version = "0.1.0"
+description = "Transaction-centric hypergraph modeling for smart contract vulnerability detection"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "torch-geometric",
+    "slither-analyzer",
+    "networkx",
+    "numpy",
+    "scikit-learn",
+    "pandas",
+    "pytest",
+    "solc-select",
+]
