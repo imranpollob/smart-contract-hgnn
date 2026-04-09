@@ -201,8 +201,13 @@ def extract_external_call_sites(
                     })
                 elif isinstance(ir, HighLevelCall):
                     # Only count calls to external contracts, not internal
-                    called_contract = ir.destination.type
-                    if str(called_contract) != target_contract.name:
+                    dest = ir.destination
+                    # destination can be a Variable (with .type) or a Contract directly
+                    if hasattr(dest, "type"):
+                        dest_name = str(dest.type)
+                    else:
+                        dest_name = str(dest)
+                    if dest_name != target_contract.name:
                         line = node.source_mapping.lines[0] if node.source_mapping.lines else 0
                         call_sites.append({
                             "function": func.name,

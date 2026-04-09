@@ -10,8 +10,8 @@
 |---|-----------|---------|--------|-------|
 | 0 | Project setup | `pyproject.toml`, dirs | ✅ Done | Using uv as package manager |
 | 1 | AST, CFG, Call Graph extraction | `src/extraction/ast_cfg.py` | ✅ Done | 25 tests passing; uses Slither IR for call detection |
-| 2 | Data Dependency Graph (G_dep) | `src/extraction/gdep.py` | ⏳ Pending | |
-| 3 | Node Set Construction (V_f, V_s, V_c) | `src/hypergraph/nodeset.py` | ⏳ Pending | |
+| 2 | Data Dependency Graph (G_dep) | `src/extraction/gdep.py` | ✅ Done | 12 tests passing; bipartite (call_site → state_var) |
+| 3 | Node Set Construction (V_f, V_s, V_c) | `src/hypergraph/nodeset.py` | ✅ Done | 15 tests; disjointness asserted |
 | 4 | Node Feature Matrix (X) | `src/hypergraph/features.py` | ⏳ Pending | |
 | 5 | Hyperedge Construction + Incidence Matrix (H) | `src/hypergraph/hyperedges.py` | ⏳ Pending | δ=3 depth bound |
 | 6 | HGNN Model | `src/model/hgnn.py` | ⏳ Pending | softmax + CrossEntropyLoss |
@@ -38,6 +38,8 @@
 | 2026-04-09 | Project review: verified feasibility, revised PLAN.md (7 fixes), updated CLAUDE.md, created ARCHITECTURE.md | PLAN.md, CLAUDE.md, ARCHITECTURE.md |
 | 2026-04-09 | Step 0: uv init, installed deps, created src/ dir structure | pyproject.toml, src/*/__init__.py |
 | 2026-04-09 | Step 1: AST/CFG/call graph extraction via Slither. Uses IR-level InternalCall for G_call edges. 25 tests. | src/extraction/ast_cfg.py, tests/test_extraction.py |
+| 2026-04-09 | Step 2: G_dep bipartite graph. Reads before / writes after call via CFG node ordering. 12 tests. | src/extraction/gdep.py, tests/test_gdep.py |
+| 2026-04-09 | Step 3: Node set construction. Fixed HighLevelCall .type bug in Step 1. 52 total tests, 50-contract pipeline 96% success. | src/hypergraph/nodeset.py, tests/test_nodeset.py, src/extraction/ast_cfg.py |
 
 ---
 
