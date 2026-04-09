@@ -1,0 +1,48 @@
+{
+  "feature_dim": 26,
+  "func_features": {
+    "offset": 0,
+    "size": 9,
+    "visibility_classes": [
+      "public",
+      "private",
+      "internal",
+      "external"
+    ],
+    "mutability_classes": [
+      "pure",
+      "view",
+      "payable",
+      "nonpayable"
+    ]
+  },
+  "state_var_features": {
+    "offset": 9,
+    "size": 12,
+    "type_categories": [
+      "uint",
+      "address",
+      "bool",
+      "bytes",
+      "mapping",
+      "array",
+      "struct",
+      "other"
+    ],
+    "access_patterns": [
+      "read_only",
+      "write_only",
+      "read_write"
+    ]
+  },
+  "call_site_features": {
+    "offset": 21,
+    "size": 5,
+    "call_opcodes": [
+      "call",
+      "delegatecall",
+      "staticcall",
+      "other"
+    ]
+  }
+}
