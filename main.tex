@@ -1,0 +1,515 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{parskip}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!10}
+}
+
+% ─────────────────────────────────────────────
+% NOTATION REFERENCE (for implementer)
+%
+%  C                  — input smart contract
+%  \mathcal{H}        — hypergraph: (\mathcal{V}, \mathcal{E}, X)
+%  \mathcal{V}        — node set = \mathcal{V}_f ∪ \mathcal{V}_s ∪ \mathcal{V}_c
+%  \mathcal{V}_f      — function nodes
+%  \mathcal{V}_s      — state variable nodes
+%  \mathcal{V}_c      — external call site nodes
+%  \mathcal{E}        — hyperedge set (one per call site)
+%  X                  — node feature matrix in R^{|V| x d}
+%  \mathbf{H}         — incidence matrix in R^{|V| x |E|}  (NOT the hypergraph)
+%  G_{call}           — call graph over \mathcal{V}_f
+%  G_{dep}            — data dependency graph over (\mathcal{V}_f ∪ \mathcal{V}_c) x \mathcal{V}_s
+%  e_c                — hyperedge for call site c = {c} ∪ F(c) ∪ S(c)
+%  F(c)               — call chain: {f} ∪ Ancestors(f, G_{call})
+%  S(c)               — dependent state vars from G_{dep}: read before or written after c
+%  Z                  — node embedding matrix after L HGNN layers in R^{|V| x d'}
+%  z_e                — hyperedge embedding: mean of Z_v for v in e
+%  \hat{y}_e          — predicted label for hyperedge e in {0, 1}
+%  y_e                — ground truth label in {0, 1}  (1 = vulnerable)
+% ─────────────────────────────────────────────
+
+\title{\textbf{Transaction-Centric Hypergraph Modeling}\\
+\large for Smart Contract Vulnerability Detection\\[0.5em]
+\normalsize Implementation Draft}
+\date{}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ═══════════════════════════════════════════
+\section{Problem Statement}
+% ═══════════════════════════════════════════
+
+Detect \textbf{reentrancy} vulnerabilities in Solidity smart contracts using \textbf{transaction-centric hypergraph modeling}, where \textbf{hyperedges represent transaction logic units} and are classified as vulnerable or non-vulnerable.
+
+\textbf{Scope:} Static analysis only --- no runtime traces, on-chain history, or oracle data at any stage.
+
+% ═══════════════════════════════════════════
+\section{Threat Model}
+% ═══════════════════════════════════════════
+
+\textbf{Attacker capabilities:}
+\begin{itemize}
+    \item Fully observes smart contract source code and bytecode.
+    \item Deploys arbitrary interacting contracts to construct multi-step exploit transactions.
+    \item Applies semantic-preserving code transformations (e.g., control-flow restructuring, injecting benign operations) to evade detection while preserving exploit behavior.
+\end{itemize}
+
+\textbf{Defender (this system):}
+\begin{itemize}
+    \item Constructs hypergraph $\mathcal{H}$ from contract source/bytecode via static analysis.
+    \item Performs hyperedge-level vulnerability classification before deployment or during audit.
+    \item Does \textbf{not} have access to runtime execution traces or future transactions.
+\end{itemize}
+
+\textbf{Out of scope:} Consensus-level attacks, off-chain exploits, key compromise, attacker violating EVM semantics, attacker compromising model training.
+
+% ═══════════════════════════════════════════
+\section{System Model}
+% ═══════════════════════════════════════════
+
+The system is a static analysis pipeline with three sequential stages:
+
+\begin{enumerate}
+    \item \textbf{Program Representation Extraction} --- parse the contract into structured graphs.
+    \item \textbf{Transaction-Centric Hypergraph Construction} --- build $\mathcal{H} = (\mathcal{V}, \mathcal{E}, X)$.
+    \item \textbf{Hyperedge-Level Vulnerability Classification} --- run HGNN and output predictions.
+\end{enumerate}
+
+\subsection{Input}
+
+\begin{itemize}
+    \item Solidity source code \textbf{or} compiled EVM bytecode.
+    \item Compiler-generated artifacts (e.g., AST).
+\end{itemize}
+
+\subsection{Program Representation Layer}
+
+From contract $C$, extract four static structures:
+
+\begin{itemize}
+    \item \textbf{AST:} syntactic structure of the contract.
+    \item \textbf{CFG:} execution paths within each function.
+    \item \textbf{Call Graph $G_{call}$:} directed graph; edge $f_i \to f_j$ if $f_i$ invokes $f_j$.
+    \item \textbf{Data Dependency Graph $G_{dep}$:} bipartite graph; edge $(n, s)$ if state variable $s$ is read before or written after node $n$ (where $n \in \mathcal{V}_f \cup \mathcal{V}_c$, $s \in \mathcal{V}_s$).
+\end{itemize}
+
+These four structures are the \textbf{only inputs} to Stage 2 (hypergraph construction).
+
+\subsection{Output}
+
+For each hyperedge $e \in \mathcal{E}$:
+\begin{itemize}
+    \item Predicted label $\hat{y}_e \in \{0, 1\}$ (1 = vulnerable).
+    \item Confidence score $p_e \in [0, 1]$.
+    \item Mapping to concrete program elements (functions, state variables, call site) for localization.
+\end{itemize}
+
+Hyperedges are ranked by $p_e$ for prioritized auditing output.
+
+\subsection{Limitations}
+
+\begin{itemize}
+    \item Purely static; does not guarantee exploitability or formal correctness.
+    \item Does not model dynamic runtime behavior or external economic conditions.
+    \item Assumes accurate extraction of program structure from input code.
+\end{itemize}
+
+% ═══════════════════════════════════════════
+\section{Hypergraph Construction}
+% ═══════════════════════════════════════════
+
+\subsection{Hypergraph Definition}
+
+\[
+\mathcal{H} = (\mathcal{V},\; \mathcal{E},\; X)
+\]
+
+\begin{itemize}
+    \item $\mathcal{V}$ --- node set (Section~\ref{sec:nodeset})
+    \item $\mathcal{E}$ --- hyperedge set (Section~\ref{sec:hyperedge})
+    \item $X \in \mathbb{R}^{|\mathcal{V}| \times d}$ --- node feature matrix (Section~\ref{sec:nodefeatures})
+\end{itemize}
+
+\subsection{Node Set}
+\label{sec:nodeset}
+
+\[
+\mathcal{V} = \mathcal{V}_f \;\cup\; \mathcal{V}_s \;\cup\; \mathcal{V}_c
+\]
+
+\begin{itemize}
+    \item $\mathcal{V}_f$ --- one node per \textbf{function} in $C$
+    \item $\mathcal{V}_s$ --- one node per \textbf{state variable} in $C$
+    \item $\mathcal{V}_c$ --- one node per \textbf{external call site} in $C$
+\end{itemize}
+
+The three sets are \textbf{disjoint}: $\mathcal{V}_f \cap \mathcal{V}_s = \mathcal{V}_f \cap \mathcal{V}_c = \mathcal{V}_s \cap \mathcal{V}_c = \emptyset$.
+
+\subsection{Node Features}
+\label{sec:nodefeatures}
+
+Each node $v \in \mathcal{V}$ has feature vector $x_v \in \mathbb{R}^d$:
+
+\begin{itemize}
+    \item $v \in \mathcal{V}_f$: AST node type, function visibility, mutability modifier.
+    \item $v \in \mathcal{V}_s$: variable type, storage slot, read/write access pattern.
+    \item $v \in \mathcal{V}_c$: call opcode (CALL, DELEGATECALL, STATICCALL), value-transfer flag.
+\end{itemize}
+
+Full matrix: $X = [x_v]_{v \in \mathcal{V}} \in \mathbb{R}^{|\mathcal{V}| \times d}$.
+
+\subsection{Incidence Matrix}
+
+\[
+\mathbf{H} \in \{0,1\}^{|\mathcal{V}| \times |\mathcal{E}|}, \qquad
+\mathbf{H}_{v,e} =
+\begin{cases}
+1 & \text{if } v \in e \\
+0 & \text{otherwise}
+\end{cases}
+\]
+
+\textbf{Important:} $\mathbf{H}$ (bold) = incidence matrix. $\mathcal{H}$ (calligraphic) = hypergraph. These are distinct.
+
+\subsection{Hyperedge Construction}
+\label{sec:hyperedge}
+
+One hyperedge per external call site. For each $c \in \mathcal{V}_c$:
+
+\[
+e_c = \{c\} \;\cup\; F(c) \;\cup\; S(c)
+\]
+
+\[
+F(c) = \{f\} \cup \operatorname{Ancestors}(f,\; G_{call}), \qquad f = \text{function containing } c
+\]
+
+\[
+S(c) = \{s \in \mathcal{V}_s \mid (c,\; s) \in G_{dep}\}
+\]
+
+Complete hyperedge set: $\mathcal{E} = \{e_c \mid c \in \mathcal{V}_c\}$.
+
+\subsection{Construction Algorithm}
+
+\begin{algorithm}[H]
+\caption{Transaction-Centric Hypergraph Construction}
+\begin{algorithmic}[1]
+\Require Contract $C$; pre-built $G_{call}$, $G_{dep}$
+\Ensure $\mathcal{H} = (\mathcal{V}, \mathcal{E}, X)$ and incidence matrix $\mathbf{H}$
+\State $\mathcal{V}_f \leftarrow$ all functions in $C$
+\State $\mathcal{V}_s \leftarrow$ all state variables in $C$
+\State $\mathcal{V}_c \leftarrow$ all external call sites in $C$
+\State $\mathcal{V} \leftarrow \mathcal{V}_f \cup \mathcal{V}_s \cup \mathcal{V}_c$
+\State $X \leftarrow$ compute feature vector $x_v$ for each $v \in \mathcal{V}$
+\State $\mathcal{E} \leftarrow \emptyset$
+\For{each $c \in \mathcal{V}_c$}
+    \State $f \leftarrow$ function in $\mathcal{V}_f$ containing $c$
+    \State $F_c \leftarrow \{f\} \cup \operatorname{Ancestors}(f,\; G_{call})$
+    \State $S_c \leftarrow \{s \in \mathcal{V}_s \mid (c,\; s) \in G_{dep}\}$
+    \State $e_c \leftarrow \{c\} \cup F_c \cup S_c$
+    \State $\mathcal{E} \leftarrow \mathcal{E} \cup \{e_c\}$
+\EndFor
+\State Build $\mathbf{H} \in \{0,1\}^{|\mathcal{V}| \times |\mathcal{E}|}$ from $\mathcal{V}$ and $\mathcal{E}$
+\State \Return $\mathcal{H} = (\mathcal{V}, \mathcal{E}, X)$, $\mathbf{H}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Worked Example: Reentrancy}
+
+\begin{lstlisting}[language={}]
+function withdraw(uint amount) {
+    require(balance[msg.sender] >= amount);   // read: balance
+    msg.sender.call{value: amount}("");        // external call site c
+    balance[msg.sender] -= amount;             // write: balance
+}
+\end{lstlisting}
+
+For $c = \texttt{msg.sender.call\{\ldots\}}$:
+\[
+F(c) = \{\texttt{withdraw}\}, \qquad S(c) = \{\texttt{balance[msg.sender]}\}
+\]
+\[
+e_c = \{\;\texttt{withdraw()},\;\; \texttt{balance[msg.sender]},\;\; c\;\}
+\]
+
+This single hyperedge captures: the pre-condition read, the external call, and the post-state write --- the complete reentrancy pattern.
+
+\subsection{Construction Complexity}
+
+\[
+O\!\left(|\mathcal{V}_c| \cdot \left(|\mathcal{V}_f| + |\mathcal{V}_s|\right)\right)
+\]
+
+% ═══════════════════════════════════════════
+\section{Hypergraph Neural Network (HGNN)}
+% ═══════════════════════════════════════════
+
+\subsection{Goal}
+
+Given $\mathcal{H}$ and $\mathbf{H}$, learn embeddings for all $e \in \mathcal{E}$ and classify each as vulnerable or non-vulnerable.
+
+\subsection{Degree Matrices}
+
+Node degree (diagonal matrix $D_v \in \mathbb{R}^{|\mathcal{V}| \times |\mathcal{V}|}$):
+\[
+D_v(i,i) = \sum_{e \in \mathcal{E}} \mathbf{H}_{i,e}
+\]
+
+Hyperedge degree (diagonal matrix $D_e \in \mathbb{R}^{|\mathcal{E}| \times |\mathcal{E}|}$):
+\[
+D_e(e,e) = \sum_{v \in \mathcal{V}} \mathbf{H}_{v,e}
+\]
+
+\subsection{Normalized Incidence}
+
+\[
+\tilde{\mathbf{H}} = D_v^{-1/2}\; \mathbf{H}\; D_e^{-1/2}
+\]
+
+\subsection{Layer-wise Message Passing}
+
+Initialize $X^{(0)} = X$. For each layer $l = 0, \ldots, L-1$:
+
+\textbf{Base (no residual):}
+\[
+X^{(l+1)} = \sigma\!\left(\tilde{\mathbf{H}}\;\tilde{\mathbf{H}}^\top X^{(l)} W^{(l)}\right)
+\]
+
+\textbf{With residual connection (use this):}
+\[
+X^{(l+1)} = X^{(l)} + \sigma\!\left(\tilde{\mathbf{H}}\;\tilde{\mathbf{H}}^\top X^{(l)} W^{(l)}\right)
+\]
+
+\textbf{Optional layer normalization} (apply after residual addition):
+\[
+X^{(l+1)} \leftarrow \operatorname{LayerNorm}\!\left(X^{(l+1)}\right)
+\]
+
+Here $W^{(l)} \in \mathbb{R}^{d \times d}$ is learnable; $\sigma$ is ReLU.
+
+\textbf{Two-step interpretation per layer:}
+\begin{enumerate}
+    \item $\tilde{\mathbf{H}}^\top X^{(l)}$: aggregate node features into hyperedge representations.
+    \item $\tilde{\mathbf{H}}(\cdot)$: broadcast hyperedge representations back to member nodes.
+\end{enumerate}
+
+\subsection{Hyperedge Embedding}
+
+After $L$ layers, final node embeddings: $Z = X^{(L)} \in \mathbb{R}^{|\mathcal{V}| \times d'}$.
+
+Hyperedge embedding via mean pooling:
+\[
+z_e = \frac{1}{|e|} \sum_{v \in e} Z_v \;\in\; \mathbb{R}^{d'}
+\]
+
+\subsection{Classifier and Output}
+
+\[
+\hat{y}_e = \operatorname{softmax}(W_c\, z_e + b_c), \qquad W_c \in \mathbb{R}^{2 \times d'},\; b_c \in \mathbb{R}^2
+\]
+
+Output: $[\,p(\text{non-vulnerable}),\; p(\text{vulnerable})\,]$. Predicted label: $\hat{y}_e = \arg\max$.
+
+\subsection{Training Loss}
+
+\[
+\mathcal{L} = -\sum_{e \in \mathcal{E}} y_e \log \hat{y}_e
+\]
+
+For class imbalance, use weighted cross-entropy (upweight the vulnerable class) or oversample vulnerable hyperedges.
+
+\subsection{Per-Layer Complexity}
+
+\[
+O\!\left(\operatorname{nnz}(\mathbf{H}) \cdot d\right)
+\]
+
+where $\operatorname{nnz}(\mathbf{H})$ = total node-hyperedge memberships.
+
+% ═══════════════════════════════════════════
+\section{Learning Task}
+% ═══════════════════════════════════════════
+
+\subsection{Task Definition}
+
+Supervised binary classification over hyperedges:
+\[
+f: \mathcal{E} \rightarrow \{0, 1\}
+\]
+$y_e = 1$ = vulnerable transaction flow; $y_e = 0$ = safe.
+
+\subsection{Label Assignment from Annotations}
+
+\[
+y_e =
+\begin{cases}
+1 & \text{if } \exists\; v \in e \text{ such that } v \text{ is annotated as vulnerable} \\
+0 & \text{otherwise}
+\end{cases}
+\]
+
+Labels are derived from existing dataset annotations at function or line level and mapped to hyperedges using this rule.
+
+\subsection{Vulnerable Pattern (Reentrancy)}
+
+A hyperedge $e_c$ is vulnerable when call site $c$ satisfies:
+\begin{itemize}
+    \item At least one $s \in S(c)$ is \textbf{read before} $c$ (pre-condition check).
+    \item The same $s$ is \textbf{written after} $c$ (state update).
+    \item No reentrancy guard (mutex or checks-effects-interactions pattern) is present.
+\end{itemize}
+
+\subsection{Per-Hyperedge Output}
+
+\begin{itemize}
+    \item $\hat{y}_e \in \{0,1\}$ --- predicted label.
+    \item $p_e \in [0,1]$ --- vulnerability confidence score.
+    \item Ranked list of $e \in \mathcal{E}$ by $p_e$ (descending) for audit prioritization.
+\end{itemize}
+
+% ═══════════════════════════════════════════
+\section{Evaluation Plan}
+% ═══════════════════════════════════════════
+
+\subsection{Datasets}
+
+Both datasets are from the same author (Matteo Rizzo) and are purpose-built for reentrancy detection research with manual verification.
+
+\subsubsection{Primary Dataset --- \texttt{reentrancy-detection-benchmarks} (Training \& Validation)}
+
+Repository: \url{https://github.com/matteo-rizzo/reentrancy-detection-benchmarks}\\
+Paper target venue: DSN 2026.
+
+This is the \textbf{main dataset} used for training, validation, and ablation. It contains two subsets:
+
+\begin{itemize}
+    \item \textbf{Aggregated Benchmark (436 contracts):} Manually re-labeled contracts aggregated from three prior academic datasets:
+    \begin{itemize}
+        \item CGT (Consolidated Ground Truth)
+        \item HuangGai (HG)
+        \item ReentrancyStudy (RS)
+    \end{itemize}
+    Final composition: \textbf{122 reentrant / 314 safe}. This is the gold-standard split used for main model training.
+
+    \item \textbf{Reentrancy Scenarios Dataset --- RS (154 contracts):} A novel handcrafted set covering subtle reentrancy patterns, modern Solidity features, and complex control flows. Used for \textbf{ablation studies}.
+\end{itemize}
+
+\textbf{Why this dataset:}
+\begin{itemize}
+    \item All labels are manually verified (not auto-labeled by tools).
+    \item Preprocessing scripts are included: \texttt{source2ast.sh} (AST via \texttt{solc}) and \texttt{source2cfg.py} (CFG via Slither) --- these directly produce the inputs required by the hypergraph construction stage (Section~4).
+    \item Predefined 3-fold cross-validation splits are provided in \texttt{cv\_splits.zip} --- no custom split logic needed.
+    \item Duplicates and non-compilable contracts are already removed.
+\end{itemize}
+
+\subsubsection{Secondary Dataset --- \texttt{manually-verified-reentrancy-dataset} (Final Held-Out Test)}
+
+Repository: \url{https://github.com/matteo-rizzo/manually-verified-reentrancy-dataset}\\
+Paper target venue: IEEE S\&P 2026. License: MIT.
+
+This dataset is used \textbf{only for final held-out evaluation} --- it is never seen during training or ablation.
+
+\begin{itemize}
+    \item Entirely handcrafted from scratch (no aggregation from prior datasets).
+    \item Labels are verified not just by human inspection but by \textbf{running actual attacker contracts via Hardhat} --- the strongest possible ground truth confirmation.
+    \item A Hardhat test environment is included in the repository (\texttt{test\_environment/}) for reproducing the exploit verification.
+\end{itemize}
+
+\textbf{Why held-out only:} Because this dataset is execution-verified (not just annotation-verified), it represents a stricter standard than the training data. Evaluating on it last gives the most honest measurement of model generalization.
+
+\subsubsection{Dataset Usage Summary}
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Dataset} & \textbf{Contracts} & \textbf{Split} & \textbf{Purpose} \\
+\midrule
+Aggregated Benchmark & 436 (122R / 314S) & 3-fold CV (predefined) & Train + Validate \\
+Reentrancy Scenarios (RS) & 154 & Full set & Ablation studies \\
+Manually Verified (Repo 2) & Handcrafted & Full set & Final held-out test \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{Preprocessing Steps}
+
+\begin{enumerate}
+    \item Clone Repo 1; use \texttt{source2ast.sh} to generate ASTs and \texttt{source2cfg.py} to generate CFGs for all contracts.
+    \item Build $G_{call}$ and $G_{dep}$ from AST + CFG outputs.
+    \item Run construction algorithm (Section~4.6) $\to$ $\mathcal{H}$, $\mathbf{H}$, $X$ per contract.
+    \item Map contract-level labels to hyperedge labels using the rule in Section~6.2.
+    \item Load predefined CV splits from \texttt{cv\_splits.zip} for training runs.
+    \item For final evaluation: repeat steps 1--4 on Repo 2 contracts (no training on this set).
+\end{enumerate}
+
+\textbf{Class imbalance note:} The training set has a 122/314 reentrant/safe ratio ($\approx$1:2.6). Apply weighted cross-entropy or oversampling as specified in Section~5.6.
+
+\subsection{Baselines}
+
+\begin{itemize}
+    \item \textbf{GCN / GAT} on AST/CFG pairwise graphs --- closest architectural baseline.
+    \item \textbf{MLP / Random Forest} on handcrafted features --- non-structural baseline.
+    \item \textbf{Slither and other static analysis tools} --- rule-based baseline. \textbf{Note:} Repo 1 (\texttt{results/}) and Repo 2 (\texttt{results/}) both contain pre-run tool results in CSV format via SmartBugs. These can be loaded directly without re-running the tools.
+\end{itemize}
+
+\subsection{Metrics}
+
+\textbf{Primary (on vulnerable class):}
+\begin{itemize}
+    \item Precision, Recall, F1-score.
+    \item $\text{FNR} = \dfrac{FN}{FN + TP}$ --- critical metric; missed vulnerabilities have direct financial impact.
+\end{itemize}
+
+\textbf{Secondary:}
+\begin{itemize}
+    \item False Positive Rate (FPR) --- usability in audit pipelines.
+    \item Localization quality: overlap of predicted vulnerable hyperedges with annotated vulnerable lines/functions.
+\end{itemize}
+
+\subsection{Ablation Study}
+
+\begin{itemize}
+    \item \textbf{Hypergraph vs.\ standard graph:} replace $\mathcal{H}$ with pairwise edges; measure F1 drop.
+    \item \textbf{Remove $S(c)$:} exclude state variables from hyperedge construction.
+    \item \textbf{Remove $F(c)$ ancestors:} use only immediate function, no call-chain expansion.
+    \item \textbf{Remove residual connections:} measure representation degradation across depth.
+    \item \textbf{Depth sensitivity:} vary $L \in \{1, 2, 3, 4\}$; report F1 vs.\ depth.
+\end{itemize}
+
+\subsection{Case Study}
+
+Select one contract with a confirmed reentrancy vulnerability. Show:
+\begin{enumerate}
+    \item The constructed $e_c$ with all member nodes labeled.
+    \item Predicted $\hat{y}_e$ and score $p_e$.
+    \item Mapping of $e_c$ back to source code lines.
+\end{enumerate}
+
+\subsection{Implementation Details}
+
+\begin{itemize}
+    \item \textbf{Framework:} PyTorch Geometric
+    \item \textbf{Optimizer:} Adam, lr $= 10^{-3}$
+    \item \textbf{Layers:} $L \in \{2, 3, 4\}$
+    \item \textbf{Runs:} 5 independent seeds; report mean $\pm$ std across all metrics.
+    \item \textbf{Hardware:} record GPU/CPU specs for reproducibility.
+\end{itemize}
+
+\end{document}
