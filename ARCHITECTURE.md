@@ -13,7 +13,7 @@
 | 2 | Data Dependency Graph (G_dep) | `src/extraction/gdep.py` | ✅ Done | 12 tests passing; bipartite (call_site → state_var) |
 | 3 | Node Set Construction (V_f, V_s, V_c) | `src/hypergraph/nodeset.py` | ✅ Done | 15 tests; disjointness asserted |
 | 4 | Node Feature Matrix (X) | `src/hypergraph/features.py` | ✅ Done | d=26; 25 tests; feature_config.json saved |
-| 5 | Hyperedge Construction + Incidence Matrix (H) | `src/hypergraph/hyperedges.py` | ⏳ Pending | δ=3 depth bound |
+| 5 | Hyperedge Construction + Incidence Matrix (H) | `src/hypergraph/hyperedges.py` | ✅ Done | δ=3 BFS; 24 tests; binary H_inc verified |
 | 6 | HGNN Model | `src/model/hgnn.py` | ⏳ Pending | softmax + CrossEntropyLoss |
 | 7 | Training Loop + CV Evaluation | `src/evaluation/train.py` | ⏳ Pending | KFold(3, shuffle, seed=42) |
 | 7.5 | Baselines (GCN, GAT, MLP, RF, tools) | `src/evaluation/baselines.py` | ⏳ Pending | |
@@ -41,6 +41,7 @@
 | 2026-04-09 | Step 2: G_dep bipartite graph. Reads before / writes after call via CFG node ordering. 12 tests. | src/extraction/gdep.py, tests/test_gdep.py |
 | 2026-04-09 | Step 3: Node set construction. Fixed HighLevelCall .type bug in Step 1. 52 total tests, 50-contract pipeline 96% success. | src/hypergraph/nodeset.py, tests/test_nodeset.py, src/extraction/ast_cfg.py |
 | 2026-04-09 | Step 4: Node feature matrix. d=26 (func:9, var:12, call:5). Fixed type classifier for structs. 77 total tests, 50-contract pipeline 0 code errors. | src/hypergraph/features.py, tests/test_features.py, feature_config.json |
+| 2026-04-09 | Step 5: Hyperedge construction + H_inc. δ=3 bounded BFS. 101 total tests, 50-contract pipeline 0 code errors. | src/hypergraph/hyperedges.py, tests/test_hyperedges.py |
 
 ---
 
