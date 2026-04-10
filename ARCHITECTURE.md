@@ -15,7 +15,7 @@
 | 4 | Node Feature Matrix (X) | `src/hypergraph/features.py` | ✅ Done | d=26; 25 tests; feature_config.json saved |
 | 5 | Hyperedge Construction + Incidence Matrix (H) | `src/hypergraph/hyperedges.py` | ✅ Done | δ=3 BFS; 24 tests; binary H_inc verified |
 | 6 | HGNN Model | `src/model/hgnn.py` | ✅ Done | 25 tests; softmax + CrossEntropyLoss; L∈{2,3,4} |
-| 7 | Training Loop + CV Evaluation | `src/evaluation/train.py` | ⏳ Pending | KFold(3, shuffle, seed=42) |
+| 7 | Training Loop + CV Evaluation | `src/evaluation/train.py` | ✅ Done | 20 tests; 3-fold CV, 5 seeds, weighted CE |
 | 7.5 | Baselines (GCN, GAT, MLP, RF, tools) | `src/evaluation/baselines.py` | ⏳ Pending | |
 | 8 | Final Held-Out Evaluation (Repo 2) | `src/evaluation/final_eval.py` | ⏳ Pending | Label mapping from dirs |
 | 9 | Ablation Studies (A1–A5) | `src/evaluation/ablation.py` | ⏳ Pending | |
@@ -43,6 +43,7 @@
 | 2026-04-09 | Step 4: Node feature matrix. d=26 (func:9, var:12, call:5). Fixed type classifier for structs. 77 total tests, 50-contract pipeline 0 code errors. | src/hypergraph/features.py, tests/test_features.py, feature_config.json |
 | 2026-04-09 | Step 5: Hyperedge construction + H_inc. δ=3 bounded BFS. 101 total tests, 50-contract pipeline 0 code errors. | src/hypergraph/hyperedges.py, tests/test_hyperedges.py |
 | 2026-04-10 | Step 6: HGNN model. Residual + LayerNorm, mean pooling, softmax classifier. 126 total tests. | src/model/hgnn.py, tests/test_hgnn.py |
+| 2026-04-10 | Step 7: Training loop + CV evaluation. 3-fold stratified CV, 5-seed runs, weighted CE, metrics CSV. 146 total tests. | src/evaluation/train.py, tests/test_train.py |
 
 ---
 
