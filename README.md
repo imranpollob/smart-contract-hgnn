@@ -15,9 +15,12 @@ This system builds a **hypergraph** from a Solidity contract's program represent
 ## Setup
 
 ```bash
-# Clone the repo
-git clone <repo-url>
+# Clone the repo with submodules (datasets) — shallow clone for speed
+git clone --recurse-submodules --depth 1 <repo-url>
 cd smart-contract-hgnn
+
+# If you've already cloned without submodules, initialize them:
+git submodule update --init --recursive --depth 1
 
 # Install dependencies with uv
 uv sync
@@ -29,19 +32,17 @@ uv run solc-select use 0.8.0
 
 ## Dataset
 
-The project uses two datasets (clone them into `data/`):
+The project uses two external datasets as **Git submodules**:
+
+| Dataset                                                                                                      | Purpose                               | Location                                     |
+| ------------------------------------------------------------------------------------------------------------ | ------------------------------------- | -------------------------------------------- |
+| [reentrancy-detection-benchmarks](https://github.com/matteo-rizzo/reentrancy-detection-benchmarks)           | Training + Validation (436 contracts) | `data/reentrancy-detection-benchmarks/`      |
+| [manually-verified-reentrancy-dataset](https://github.com/matteo-rizzo/manually-verified-reentrancy-dataset) | Held-out test set (Step 8 only)       | `data/manually-verified-reentrancy-dataset/` |
+
+Datasets are cloned automatically with `--recurse-submodules`. To pull latest updates:
 
 ```bash
-mkdir -p data
-cd data
-
-# Primary dataset (training + validation)
-git clone https://github.com/matteo-rizzo/reentrancy-detection-benchmarks.git
-
-# Secondary dataset (held-out test only — Step 8)
-git clone https://github.com/matteo-rizzo/manually-verified-reentrancy-dataset.git
-
-cd ..
+git submodule update --remote  # Update all submodules to latest
 ```
 
 **Primary dataset structure:**
@@ -104,14 +105,14 @@ uv run python -m src.evaluation.train \
     --results-dir results
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--epochs` | 50 | Training epochs per fold |
-| `--lr` | 1e-3 | Learning rate (Adam) |
-| `--hidden-dim` | 64 | HGNN hidden dimension |
-| `--n-layers` | 2 | Number of HGNN message passing layers (2, 3, or 4) |
-| `--seeds` | 42 0 1 2 3 | Random seeds for multi-run evaluation |
-| `--results-dir` | results | Directory for output CSVs and metrics |
+| Flag            | Default    | Description                                        |
+| --------------- | ---------- | -------------------------------------------------- |
+| `--epochs`      | 50         | Training epochs per fold                           |
+| `--lr`          | 1e-3       | Learning rate (Adam)                               |
+| `--hidden-dim`  | 64         | HGNN hidden dimension                              |
+| `--n-layers`    | 2          | Number of HGNN message passing layers (2, 3, or 4) |
+| `--seeds`       | 42 0 1 2 3 | Random seeds for multi-run evaluation              |
+| `--results-dir` | results    | Directory for output CSVs and metrics              |
 
 ### Output
 
@@ -123,13 +124,13 @@ Training produces:
 
 ### Metrics reported
 
-| Metric | Description |
-|--------|-------------|
-| Precision | TP / (TP + FP) for vulnerable class |
-| Recall | TP / (TP + FN) for vulnerable class |
-| F1 | Harmonic mean of precision and recall |
-| FNR | FN / (FN + TP) — false negative rate |
-| FPR | FP / (FP + TN) — false positive rate |
+| Metric    | Description                           |
+| --------- | ------------------------------------- |
+| Precision | TP / (TP + FP) for vulnerable class   |
+| Recall    | TP / (TP + FN) for vulnerable class   |
+| F1        | Harmonic mean of precision and recall |
+| FNR       | FN / (FN + TP) — false negative rate  |
+| FPR       | FP / (FP + TN) — false positive rate  |
 
 ## Technical Details
 
