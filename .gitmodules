@@ -1,0 +1,6 @@
+[submodule "data/reentrancy-detection-benchmarks"]
+	path = data/reentrancy-detection-benchmarks
+	url = https://github.com/matteo-rizzo/reentrancy-detection-benchmarks.git
+[submodule "data/manually-verified-reentrancy-dataset"]
+	path = data/manually-verified-reentrancy-dataset
+	url = https://github.com/matteo-rizzo/manually-verified-reentrancy-dataset.git
