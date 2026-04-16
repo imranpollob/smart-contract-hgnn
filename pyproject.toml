@@ -13,4 +13,5 @@ dependencies = [
     "pandas",
     "pytest",
     "solc-select",
+    "matplotlib>=3.10.8",
 ]
