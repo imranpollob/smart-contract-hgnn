@@ -133,6 +133,62 @@ class TestWithdrawExample:
         assert write_idx is not None
         assert write_idx > call_idx
 
+    def test_call_site_reentrancy_fields_present(self):
+        """New reentrancy context fields should be populated on each call site."""
+        cs = self.result["call_sites"][0]
+        # Extracted via IR
+        assert "gas_forwarded" in cs
+        assert "sender_controlled_target" in cs
+        assert "guarded_by_modifier" in cs
+        # Populated by annotate_call_site_context from the CFG
+        assert "writes_after_call" in cs
+        assert "reads_after_call" in cs
+        assert "reads_before_call" in cs
+
+    def test_withdraw_call_is_gas_forwarding(self):
+        """.call{value: ...}('') forwards all remaining gas."""
+        cs = self.result["call_sites"][0]
+        assert cs["gas_forwarded"] is True
+
+    def test_withdraw_call_target_sender_controlled(self):
+        """withdraw's external call is to msg.sender, attacker-controlled."""
+        cs = self.result["call_sites"][0]
+        assert cs["sender_controlled_target"] is True
+
+    def test_withdraw_call_not_guarded(self):
+        """withdraw has no nonReentrant modifier."""
+        cs = self.result["call_sites"][0]
+        assert cs["guarded_by_modifier"] is False
+
+    def test_withdraw_balance_written_after_call(self):
+        """balance is in writes_after_call for the withdraw call site."""
+        cs = self.result["call_sites"][0]
+        assert "balance" in cs["writes_after_call"]
+
+    def test_withdraw_balance_read_before_call(self):
+        """balance is read (via require) before the external call."""
+        cs = self.result["call_sites"][0]
+        assert "balance" in cs["reads_before_call"]
+
+
+class TestExtractAllWithLabel:
+    """When contract_label is passed, extract_all should return per-call labels."""
+
+    def test_safe_contract_all_zero(self):
+        r = extract_all(WITHDRAW_SOL, contract_label=0)
+        assert r is not None
+        assert "call_site_labels" in r
+        assert all(v == 0 for v in r["call_site_labels"].values())
+        assert r["label_info"]["contract_label"] == 0
+
+    def test_reentrant_contract_has_labels(self):
+        r = extract_all(WITHDRAW_SOL, contract_label=1)
+        assert r is not None
+        assert "call_site_labels" in r
+        # Withdraw has one call site; Slither should flag it (or fallback does).
+        assert len(r["call_site_labels"]) == 1
+        assert all(v == 1 for v in r["call_site_labels"].values())
+
 
 class TestNoExternalCalls:
     """Contract with no external calls should not crash."""

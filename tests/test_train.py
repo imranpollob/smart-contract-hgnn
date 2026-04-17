@@ -14,6 +14,7 @@ from src.evaluation.train import (
     CLASS_WEIGHTS,
     REENTRANT_DIR,
     SAFE_DIR,
+    compute_class_weights,
     compute_metrics,
     evaluate,
     generate_cv_splits,
@@ -133,6 +134,19 @@ class TestProcessContract:
         assert result["n_hyperedges"] == 1
         assert result["X"].shape[1] == FEATURE_DIM
 
+    def test_per_hyperedge_labels_present(self):
+        """process_contract now writes per-hyperedge labels aligned with V_c."""
+        result = process_contract(WITHDRAW_SOL, label=1)
+        assert result is not None
+        assert "labels" in result
+        assert len(result["labels"]) == result["n_hyperedges"]
+
+    def test_safe_contract_all_zero_labels(self):
+        """A safe label should yield all-zero per-hyperedge labels."""
+        result = process_contract(WITHDRAW_SOL, label=0)
+        assert result is not None
+        assert result["labels"] == [0] * result["n_hyperedges"]
+
     def test_no_calls_returns_none(self):
         """Contract with no external calls should return None (no hyperedges)."""
         result = process_contract(NO_CALLS_SOL, label=0)
@@ -189,6 +203,46 @@ class TestComputeMetrics:
         m = compute_metrics([], [])
         assert m["accuracy"] == 0.0
         assert m["n_total"] == 0
+
+
+# ── Class Weight Tests ─────────────────────────────────────────────
+
+
+class TestComputeClassWeights:
+    """compute_class_weights derives weights from per-hyperedge label distribution."""
+
+    def test_balanced_labels(self):
+        data = [{"labels": [0, 1, 0, 1], "n_hyperedges": 4, "label": 1}]
+        w = compute_class_weights(data)
+        assert w[0].item() == 1.0
+        assert w[1].item() == pytest.approx(1.0)
+
+    def test_imbalanced_labels(self):
+        # 3 neg, 1 pos -> weight[1] == 3.0
+        data = [{"labels": [0, 0, 0, 1], "n_hyperedges": 4, "label": 1}]
+        w = compute_class_weights(data)
+        assert w[1].item() == pytest.approx(3.0)
+
+    def test_clamps_when_positives_zero(self):
+        data = [{"labels": [0, 0, 0], "n_hyperedges": 3, "label": 0}]
+        w = compute_class_weights(data, clamp=10.0)
+        assert w[1].item() == 10.0
+
+    def test_clamp_cap(self):
+        # 100 neg, 1 pos would yield 100 without clamp; clamped to 10.
+        data = [
+            {"labels": [0] * 100, "n_hyperedges": 100, "label": 0},
+            {"labels": [1], "n_hyperedges": 1, "label": 1},
+        ]
+        w = compute_class_weights(data, clamp=10.0)
+        assert w[1].item() == 10.0
+
+    def test_fallback_to_contract_label(self):
+        """Data that predates per-hyperedge labels should still compute weights."""
+        data = [{"n_hyperedges": 4, "label": 1}]
+        w = compute_class_weights(data)
+        # All 4 hyperedges labeled 1 via fallback -> no negatives, clamp fires.
+        assert w[1].item() == 10.0
 
 
 # ── Training Tests ─────────────────────────────────────────────────

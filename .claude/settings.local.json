@@ -5,7 +5,8 @@
       "Bash(uv --version)",
       "Bash(uv init:*)",
       "Bash(uv sync:*)",
-      "Bash(uv run:*)"
+      "Bash(uv run:*)",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

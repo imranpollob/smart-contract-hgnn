@@ -39,7 +39,7 @@ Step 2: CFG analysis ──► G_dep (bipartite: call_site → state_var)
 Step 3: Naming ──► V_f, V_s, V_c, V, node_index
     │
     ▼
-Step 4: Feature encoding ──► X ∈ R^{|V| × 26}
+Step 4: Feature encoding ──► X ∈ R^{|V| × 34}
     │
     ▼
 Step 5: BFS + G_dep lookup ──► E (hyperedge list), H_inc ∈ {0,1}^{|V| × |E|}
@@ -220,13 +220,20 @@ V   = [func:deposit, func:withdraw, var:balance, call:withdraw:13]  — 4 total
 
 **Code**: `src/hypergraph/features.py` → `build_feature_matrix(...)`
 
-**What it does**: Each node gets a feature vector of dimension **d = 26**. The features are **type-specific** — function nodes use one region of the vector, state variable nodes use another, and call site nodes use a third. Unused regions are zero-padded.
+**What it does**: Each node gets a feature vector of dimension **d = 34**. The features are **type-specific** — function nodes use one region of the vector, state variable nodes use another, and call site nodes use a third. Unused regions are zero-padded.
 
-### Feature Layout (d = 26)
+The dimension grew from 26 → 34 when the **reentrancy-specific features**
+(Section 4.3 extended) were added on V_s and V_c. These flags/counts carry
+the defining reentrancy pattern — gas-forwarding call to an attacker-
+controlled target, followed by an unguarded state write — directly into the
+node features the HGNN sees.
+
+### Feature Layout (d = 34)
 
 ```
-Index:  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25
-        ├─── func features (9) ──┤  ├───── state var features (12) ──────┤  ├─ call (5) ┤
+Index:  0  1  2  3  4  5  6  7  8   9 10 11 12 13 14 15 16   17   18 19 20   21 22   23 24 25 26   27   28 29 30   31 32 33
+        ├───── func features (9) ──┤  ├────── type category (8) ──────┤  slot  ├access┤  ├flags┤  ├── call opcode ─┤  val  ├ reentrancy flags + log-counts ┤
+        ├─── V_f (9) ──────────────┤  ├──────────────── V_s (14) ─────────────────────────────┤  ├──────────────── V_c (11) ──────────────────────────────┤
 ```
 
 #### Function Node Features [indices 0–8]
@@ -237,13 +244,15 @@ Index:  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 2
 | 4–7 | Mutability | One-hot: `[pure, view, payable, nonpayable]` |
 | 8 | Is Constructor | Binary: 0 or 1 |
 
-#### State Variable Features [indices 9–20]
+#### State Variable Features [indices 9–22]
 
 | Index | Feature | Encoding |
 |-------|---------|----------|
 | 9–16 | Type Category | One-hot: `[uint, address, bool, bytes, mapping, array, struct, other]` |
 | 17 | Normalized Slot | `slot / max_slot` (continuous, 0 to 1) |
 | 18–20 | Access Pattern | One-hot: `[read_only, write_only, read_write]` |
+| 21 | Written After Call | Binary: var is written after some external call in the same function |
+| 22 | Read Before Call | Binary: var is read before some external call in the same function |
 
 **Type classification** maps Solidity types to categories:
 - `mapping(address => uint256)` → `"mapping"` (index 13)
@@ -256,17 +265,23 @@ Index:  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 2
 - `write_only`: the variable is only written, never read
 - `read_write`: the variable is both read and written (like `balance`)
 
-#### Call Site Features [indices 21–25]
+#### Call Site Features [indices 23–33]
 
 | Index | Feature | Encoding |
 |-------|---------|----------|
-| 21–24 | Call Opcode | One-hot: `[call, delegatecall, staticcall, other]` |
-| 25 | Value Transfer | Binary: 1 if ETH is sent with the call |
+| 23–26 | Call Opcode | One-hot: `[call, delegatecall, staticcall, other]` |
+| 27 | Value Transfer | Binary: 1 if ETH is sent with the call |
+| 28 | Gas Forwarded | Binary: `.call`/`.delegatecall`/`.staticcall` (forwards all remaining gas — exploitable). `.send`/`.transfer` forward only 2300 gas and cannot re-enter. |
+| 29 | Sender-Controlled Target | Binary: call destination is `msg.sender` or a function parameter — attacker can steer it |
+| 30 | Guarded by Modifier | Binary: enclosing function carries a `nonReentrant`-style modifier |
+| 31 | log1p(writes_after_call_count) | Continuous: how many state vars are written after this call in the same function |
+| 32 | log1p(reads_after_call_count) | Continuous: how many are read after |
+| 33 | log1p(reads_before_call_count) | Continuous: how many are read before |
 
 ### Actual Feature Vectors for Withdraw
 
 ```
-X shape: (4, 26)
+X shape: (4, 34)
 
 [0] func:deposit        nonzero: [(0, 1.0), (6, 1.0)]
     → index 0 = visibility:public, index 6 = mutability:payable
@@ -274,18 +289,28 @@ X shape: (4, 26)
 [1] func:withdraw       nonzero: [(0, 1.0), (7, 1.0)]
     → index 0 = visibility:public, index 7 = mutability:nonpayable
 
-[2] var:balance          nonzero: [(13, 1.0), (20, 1.0)]
-    → index 13 = type:mapping, index 20 = access:read_write
+[2] var:balance          nonzero: [(13, 1.0), (20, 1.0), (21, 1.0), (22, 1.0)]
+    → index 13 = type:mapping, index 20 = access:read_write,
+      index 21 = written_after_call, index 22 = read_before_call
 
-[3] call:withdraw:13     nonzero: [(21, 1.0), (25, 1.0)]
-    → index 21 = opcode:call, index 25 = value_transfer:yes
+[3] call:withdraw:13     nonzero: [(23, 1.0), (27, 1.0), (28, 1.0), (29, 1.0),
+                                    (31, log1p(1)), (33, log1p(1))]
+    → index 23 = opcode:call, index 27 = value_transfer,
+      index 28 = gas_forwarded (.call forwards all gas),
+      index 29 = sender_controlled_target (msg.sender.call),
+      index 31 = log1p(writes_after_call) > 0 (balance written after),
+      index 33 = log1p(reads_before_call) > 0 (balance read before)
 ```
 
-**Interpretation**: Each vector encodes exactly what the spec calls for:
+**Interpretation**: Each vector encodes exactly what the spec calls for, and
+the reentrancy pattern is now directly visible in the feature matrix:
 - `func:deposit` is public+payable
 - `func:withdraw` is public+nonpayable
-- `var:balance` is a mapping that is both read and written
-- `call:withdraw:13` uses the `call` opcode and sends ETH
+- `var:balance` is a mapping that is both read and written, **and** the
+  written-after-call / read-before-call bits flag the exact reentrancy pattern
+- `call:withdraw:13` uses the `call` opcode, sends ETH, forwards all gas, has
+  an attacker-controlled target (`msg.sender`), is not guarded, and has state
+  writes after it — every dimension of the reentrancy recipe
 
 ---
 
@@ -442,7 +467,7 @@ The combined `Θ · X` effectively says: "each node's new representation is a we
 ### Step 6d: Layer-wise Message Passing (L = 2 layers)
 
 ```
-Input: X^(0) = InputProjection(X)     — project from d=26 to hidden_dim=16
+Input: X^(0) = InputProjection(X)     — project from d=34 to hidden_dim=16
 
 For each layer l = 0, 1:
     X_new = ReLU(Θ · X^(l) · W^(l))  — message passing + linear transform + activation
@@ -490,35 +515,51 @@ The output shape is always `(|E|, 2) = (|V_c|, 2)` — one probability distribut
 ### Model Architecture Summary
 
 ```
-InputProjection: Linear(26 → 16, bias=False)     — 416 params
+InputProjection: Linear(34 → 16, bias=False)     — 544 params
 Layer 0:         Linear(16 → 16, bias=False)      — 256 params
 LayerNorm 0:     LayerNorm(16)                     — 32 params
 Layer 1:         Linear(16 → 16, bias=False)      — 256 params
 LayerNorm 1:     LayerNorm(16)                     — 32 params
 Classifier:      Linear(16 → 2)                    — 34 params
 ────────────────────────────────────────────────────────────────
-Total:                                              1,026 params
+Total:                                              1,154 params
 ```
 
 ---
 
 ## 9. Training: Loss and Optimization
 
-### Label Assignment
+### Label Assignment (Section 6.2 revised — per call site)
 
-Labels come from the **directory** the contract lives in:
-- `reentrant/` → all hyperedges get label **1** (vulnerable)
-- `safe/` → all hyperedges get label **0** (safe)
+Labels are assigned **per hyperedge** (not per contract) because each hyperedge
+corresponds to a single external call site, and within a reentrant contract
+usually only one or two call sites are actually vulnerable:
 
-For Withdraw (a vulnerable contract): `y_true = [1]`
+- **Safe contract** (directory `safe/`): every hyperedge gets label **0**.
+- **Reentrant contract** (directory `reentrant/`): Slither's reentrancy
+  detectors (`ReentrancyEth`, `ReentrancyReadBeforeWritten`, `ReentrancyNoGas`,
+  `ReentrancyBenign`, `ReentrancyEvent`) flag the specific `(function, line)`
+  pairs that exhibit the vulnerability. Only those call sites get label **1**;
+  the other call sites in the same contract get **0**.
+- **Fallback**: if the contract is known-reentrant but Slither flags nothing
+  (detector misses it), all its hyperedges fall back to label **1** so the
+  positive is not lost.
+
+For Withdraw (a vulnerable contract with one call site that Slither flags):
+`y_true = [1]`.
+
+Implementation: `src/extraction/labels.py` → `compute_call_site_labels(...)`.
 
 ### Loss Function
 
-**Weighted Cross-Entropy Loss** to handle class imbalance (122 reentrant vs 314 safe):
+**Weighted Cross-Entropy Loss** with **per-fold** class weights. Once labels
+are per call site, the positive rate is much lower than the contract-level
+ratio (closer to 1 : 10 than 1 : 2.57), and it varies between folds:
 
 ```
-weights = [1.0, 2.57]    — vulnerable class gets 2.57× weight
-loss = CrossEntropyLoss(logits, labels, weight=weights)
+class_weights = compute_class_weights(train_data, clamp=10.0)
+            # = [1.0, n_neg / max(n_pos, 1)] clamped to [1.0, 10.0]
+loss = CrossEntropyLoss(logits, labels, weight=class_weights)
 ```
 
 For the untrained model on Withdraw:
@@ -679,7 +720,7 @@ These are from an **untrained** model — predictions are near random. After tra
 | V_f | `V_f` | `list[str]`, length `\|V_f\|` | Function node identifiers |
 | V_s | `V_s` | `list[str]`, length `\|V_s\|` | State variable node identifiers |
 | V_c | `V_c` | `list[str]`, length `\|V_c\|` | Call site node identifiers |
-| X | `X` | `np.ndarray (|V|, 26)` | Node feature matrix |
+| X | `X` | `np.ndarray (|V|, 34)` | Node feature matrix |
 | G_call | `G_call` | `nx.DiGraph` | Call graph over function names |
 | G_dep | `G_dep` | `nx.DiGraph` | Bipartite: call_site → state_var |
 | E | `E` | `list[set[str]]`, length `\|E\|` = `\|V_c\|` | Hyperedge sets |
@@ -690,5 +731,5 @@ These are from an **untrained** model — predictions are near random. After tra
 | z_e | `z_e` | `torch.Tensor (hidden_dim,)` | Hyperedge embedding (mean pool) |
 | ŷ | `y_pred` | `torch.Tensor (|E|, 2)` | Softmax output [p(safe), p(vuln)] |
 
-### For Withdraw: `|V|=4, |E|=1, d=26`
-### For PERSONAL_BANK: `|V|=13, |E|=3, d=26`
+### For Withdraw: `|V|=4, |E|=1, d=34`
+### For PERSONAL_BANK: `|V|=13, |E|=3, d=34`

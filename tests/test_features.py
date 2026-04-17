@@ -17,6 +17,7 @@ from src.hypergraph.features import (
     build_feature_matrix,
     get_feature_config,
     _classify_solidity_type,
+    _compute_state_var_reentrancy_flags,
 )
 from src.hypergraph.nodeset import build_node_sets
 
@@ -53,9 +54,24 @@ class TestFeatureDimensions:
     def test_feature_dim_sum(self):
         assert FEATURE_DIM == N_FUNC_FEATURES + N_STATE_FEATURES + N_CALL_FEATURES
 
+    def test_feature_dim_is_34(self):
+        """Expected total after adding reentrancy-specific features.
+        Spec: Section 4.3 (extended) — 9 + 14 + 11 = 34."""
+        assert FEATURE_DIM == 34
+
+    def test_state_dim_includes_reentrancy_flags(self):
+        assert N_STATE_FEATURES == 14
+
+    def test_call_dim_includes_reentrancy_flags(self):
+        assert N_CALL_FEATURES == 11
+
     def test_feature_config_matches(self):
         config = get_feature_config()
         assert config["feature_dim"] == FEATURE_DIM
+        assert config["state_var_features"]["size"] == N_STATE_FEATURES
+        assert config["call_site_features"]["size"] == N_CALL_FEATURES
+        assert "reentrancy_flags" in config["call_site_features"]
+        assert "reentrancy_counts" in config["call_site_features"]
 
 
 class TestWithdrawFeatures:
@@ -140,6 +156,47 @@ class TestWithdrawFeatures:
         assert row[cs_start] == 1.0
         # value_transfer at cs_start+4
         assert row[cs_start + 4] == 1.0
+
+    def test_call_site_reentrancy_flags(self):
+        """withdraw's call site should have the reentrancy signal bits set."""
+        cs_node = self.ns["V_c"][0]
+        idx = self.ns["node_index"][cs_node]
+        row = self.X[idx]
+        cs_start = N_FUNC_FEATURES + N_STATE_FEATURES
+        # Layout after cs_start: opcode(4) | value(1) | gas_forwarded(1)
+        # | sender_controlled(1) | guarded(1) | writes_after(1) | reads_after(1) | reads_before(1)
+        assert row[cs_start + 5] == 1.0  # gas_forwarded (.call forwards all gas)
+        assert row[cs_start + 6] == 1.0  # sender_controlled_target (msg.sender.call)
+        assert row[cs_start + 7] == 0.0  # guarded_by_modifier: withdraw has no guard
+        # log1p(>=1) > 0 — there is at least one state var written after the call.
+        assert row[cs_start + 8] > 0.0
+
+    def test_state_var_reentrancy_flags(self):
+        """balance is both written after a call and read before one."""
+        idx = self.ns["node_index"]["var:balance"]
+        row = self.X[idx]
+        # State-var layout: offset 9 = N_FUNC_FEATURES
+        # type(8) | slot(1) | access(3) | written_after_call(1) | read_before_call(1)
+        written_after_idx = N_FUNC_FEATURES + 8 + 1 + 3  # 21
+        read_before_idx = written_after_idx + 1  # 22
+        assert row[written_after_idx] == 1.0
+        assert row[read_before_idx] == 1.0
+
+
+class TestStateVarReentrancyAggregation:
+    def test_aggregates_across_call_sites(self):
+        state_vars = [{"name": "balance"}, {"name": "other"}, {"name": "unused"}]
+        call_sites = [
+            {"writes_after_call": ["balance"], "reads_before_call": ["balance"]},
+            {"writes_after_call": [], "reads_before_call": ["other"]},
+        ]
+        written, read_before = _compute_state_var_reentrancy_flags(call_sites, state_vars)
+        assert written["balance"] is True
+        assert written["other"] is False
+        assert written["unused"] is False
+        assert read_before["balance"] is True
+        assert read_before["other"] is True
+        assert read_before["unused"] is False
 
 
 class TestTypeClassification:

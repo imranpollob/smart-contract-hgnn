@@ -54,8 +54,10 @@ Follow these exactly as specified in `Hypergraph_Analysis.tex`:
 3. **HGNN propagation uses residual connections** — the base formula without residual is for reference only. Always implement the residual version.
 4. **Hyperedge embedding = mean pooling** over member node embeddings — no attention, no max pooling.
 5. **Classifier = linear layer + softmax over 2 classes** — output shape is `[2]` per hyperedge `[p(non-vulnerable), p(vulnerable)]`.
-6. **Loss = `nn.CrossEntropyLoss`** with class weighting to handle 1:2.6 imbalance (122 reentrant / 314 safe).
-7. **L ∈ {2, 3, 4}** layers — make this a configurable hyperparameter, default = 2.
+6. **Loss = `nn.CrossEntropyLoss`** with class weighting derived per-fold from the actual per-hyperedge label distribution (`compute_class_weights` in `src/evaluation/train.py`, clamp=10). The legacy 1:2.57 contract-level ratio is no longer the right signal because labels are now assigned per call site, not per contract.
+7. **Per-hyperedge labels (Section 6.2 revised):** for reentrant contracts, Slither's reentrancy detectors (`src/extraction/labels.py`) pick out which specific call sites are actually vulnerable; the rest of the call sites in the same contract are labeled 0. If Slither flags no call site in a reentrant contract we fall back to the directory-level label. Safe contracts always get all-zero labels.
+8. **Feature dimension d = 34** (`N_FUNC_FEATURES=9 + N_STATE_FEATURES=14 + N_CALL_FEATURES=11`). V_s adds `written_after_call` and `read_before_call` bits; V_c adds `gas_forwarded`, `sender_controlled_target`, `guarded_by_modifier`, and log-normalized counts for `writes_after_call`, `reads_after_call`, `reads_before_call`. These carry the reentrancy pattern directly into node features — see `src/hypergraph/features.py`.
+9. **L ∈ {2, 3, 4}** layers — make this a configurable hyperparameter, default = 2.
 
 ---
 
@@ -74,7 +76,7 @@ Follow these exactly as specified in `Hypergraph_Analysis.tex`:
 - Never use this during training or ablation.
 - Load it only in the final evaluation step (Step 8 of PLAN.md).
 
-**Class imbalance:** use weighted cross-entropy. Weight for reentrant class = `314/122 ≈ 2.57`.
+**Class imbalance:** use weighted cross-entropy. Weights are computed per-fold from the per-hyperedge label distribution via `compute_class_weights` (clamp at 10.0). The old contract-level 1:2.57 ratio is preserved as `CLASS_WEIGHTS` only as a fallback for ad-hoc test runs that never see a full fold.
 
 ---
 

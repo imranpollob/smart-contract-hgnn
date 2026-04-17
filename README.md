@@ -57,11 +57,12 @@ data/reentrancy-detection-benchmarks/benchmarks/aggregated-benchmark/src/
 ```
 src/
 ├── extraction/
-│   ├── ast_cfg.py      # Step 1: AST, CFG, call graph extraction via Slither
-│   └── gdep.py         # Step 2: Data dependency graph (G_dep)
+│   ├── ast_cfg.py      # Step 1: AST, CFG, call graph extraction + per-call reentrancy context
+│   ├── gdep.py         # Step 2: Data dependency graph (G_dep)
+│   └── labels.py       # Section 6.2 (revised): per-call-site labels via Slither detectors
 ├── hypergraph/
 │   ├── nodeset.py      # Step 3: Node set construction (V_f, V_s, V_c)
-│   ├── features.py     # Step 4: Node feature matrix (X), d=26
+│   ├── features.py     # Step 4: Node feature matrix (X), d=34
 │   └── hyperedges.py   # Step 5: Hyperedge construction + incidence matrix (H)
 ├── model/
 │   └── hgnn.py         # Step 6: HGNN model (PyTorch)
@@ -135,7 +136,8 @@ Training produces:
 ## Technical Details
 
 - **HGNN architecture**: Spectral convolution on hypergraphs (Feng et al., 2019) with residual connections, LayerNorm, and mean pooling
-- **Loss**: Weighted CrossEntropyLoss (class weights: safe=1.0, vulnerable=2.57 to handle 1:2.6 imbalance)
+- **Loss**: Weighted CrossEntropyLoss with weights derived per-fold from the actual per-hyperedge label distribution (`compute_class_weights`, clamp=10.0). The old contract-level 1:2.57 ratio is no longer used because labels are now per call site, not per contract.
+- **Per-hyperedge labels (Section 6.2 revised)**: for reentrant contracts, Slither's reentrancy detectors flag the specific call sites that are actually vulnerable (`src/extraction/labels.py`); the rest get label 0. Safe contracts always get all-zero labels. Fallback to contract-level label applies only when Slither flags no call site in a known-reentrant contract.
 - **CV**: 3-fold stratified cross-validation via `sklearn.KFold(n_splits=3, shuffle=True, random_state=42)`, applied per class
-- **Features**: 26-dimensional node features (function: 9, state variable: 12, call site: 5)
+- **Features**: 34-dimensional node features — function: 9, state variable: 14 (includes `written_after_call`, `read_before_call`), call site: 11 (includes `gas_forwarded`, `sender_controlled_target`, `guarded_by_modifier`, log1p counts of `writes_after_call`, `reads_after_call`, `reads_before_call`). Encodes the defining reentrancy pattern directly in V_c / V_s node features.
 - **Hyperedges**: One per external call site, bounded ancestor expansion with delta=3

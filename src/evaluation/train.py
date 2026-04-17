@@ -46,7 +46,10 @@ DEFAULT_LR = 1e-3
 DEFAULT_HIDDEN_DIM = 64
 DEFAULT_N_LAYERS = 2
 
-# Class weights: safe=1.0, reentrant=2.57 (314/122 ≈ 2.57)
+# Fallback class weights for ad-hoc test runs that never see a full fold. The
+# production pipeline computes weights from the actual per-hyperedge label
+# distribution via compute_class_weights() — the contract-level 1:2.57 ratio
+# is no longer the right signal once labels are assigned per call site.
 CLASS_WEIGHTS = torch.tensor([1.0, 2.57], dtype=torch.float32)
 
 
@@ -109,12 +112,19 @@ def process_contract(sol_path: str, label: int, contract_name: str | None = None
     """
     Run Steps 1-5 on a single contract and return all data needed for training.
 
+    Per-hyperedge labels (Section 6.2, revised): we no longer assign the
+    contract-level label to every hyperedge. For reentrant contracts, Slither's
+    reentrancy detectors pick out the specific call sites that are actually
+    vulnerable; the rest of the call sites in the same contract are labeled 0.
+    Safe contracts keep all-zero labels.
+
     Returns:
-        dict with keys: X, H_inc, E, node_index, label, n_hyperedges, sol_path
-        or None if extraction fails.
+        dict with keys: X, H_inc, E, node_index, label (contract-level),
+        labels (per-hyperedge list aligned with E/V_c), n_hyperedges, sol_path,
+        label_info, or None if extraction fails.
     """
     try:
-        r = extract_all(sol_path, contract_name=contract_name)
+        r = extract_all(sol_path, contract_name=contract_name, contract_label=label)
         if r is None:
             return None
 
@@ -134,14 +144,20 @@ def process_contract(sol_path: str, label: int, contract_name: str | None = None
             # No external calls — no hyperedges to classify
             return None
 
+        # Align per-hyperedge labels with the V_c / E ordering.
+        cs_labels = r.get("call_site_labels", {})
+        labels = [int(cs_labels.get(c, label)) for c in ns["V_c"]]
+
         return {
             "X": X,
             "H_inc": H_inc,
             "E": E,
             "node_index": ns["node_index"],
             "label": label,
+            "labels": labels,
             "n_hyperedges": len(E),
             "sol_path": sol_path,
+            "label_info": r.get("label_info", {}),
         }
     except Exception as e:
         logger.warning(f"Failed to process {sol_path}: {e}")
@@ -176,6 +192,9 @@ def train_epoch(
     Train one epoch over all contracts.
     Spec: Section 7 — per-contract forward pass + loss aggregation.
 
+    Uses per-hyperedge labels (Section 6.2 revised): only call sites flagged
+    by Slither's reentrancy detectors are labeled 1 in reentrant contracts.
+
     Returns:
         Average loss over all hyperedges in the epoch.
     """
@@ -188,12 +207,14 @@ def train_epoch(
         H_inc = torch.tensor(contract["H_inc"], dtype=torch.float32)
         E = contract["E"]
         node_index = contract["node_index"]
-        label = contract["label"]
         n_edges = contract["n_hyperedges"]
 
-        # All hyperedges in a contract share the same label
-        # Spec: Section 6.2 — contract-level label assignment
-        labels = torch.full((n_edges,), label, dtype=torch.long)
+        # Per-hyperedge labels; fall back to the contract label if a run
+        # predates the per-call-site labeler.
+        per_edge = contract.get("labels")
+        if per_edge is None:
+            per_edge = [contract["label"]] * n_edges
+        labels = torch.tensor(per_edge, dtype=torch.long)
 
         logits = model.forward_logits(X, H_inc, E, node_index)
         loss = loss_fn(logits, labels)
@@ -216,6 +237,9 @@ def evaluate(
     Evaluate model on validation data.
     Spec: Section 7 — Precision, Recall, F1, FNR, FPR.
 
+    Metrics are computed against the per-hyperedge labels written by
+    process_contract (Section 6.2 revised).
+
     Returns:
         dict with metrics: precision, recall, f1, fnr, fpr, accuracy,
         and per-hyperedge predictions list.
@@ -231,27 +255,69 @@ def evaluate(
             H_inc = torch.tensor(contract["H_inc"], dtype=torch.float32)
             E = contract["E"]
             node_index = contract["node_index"]
-            label = contract["label"]
+            contract_label = contract["label"]
             n_edges = contract["n_hyperedges"]
+
+            per_edge = contract.get("labels")
+            if per_edge is None:
+                per_edge = [contract_label] * n_edges
 
             y_pred = model(X, H_inc, E, node_index)
             pred_labels = y_pred.argmax(dim=1).tolist()
-            true_labels = [label] * n_edges
 
             all_preds.extend(pred_labels)
-            all_labels.extend(true_labels)
+            all_labels.extend(per_edge)
 
             for j, (pred, prob) in enumerate(zip(pred_labels, y_pred.tolist())):
                 predictions.append({
                     "sol_path": contract["sol_path"],
                     "hyperedge_idx": j,
-                    "true_label": label,
+                    "contract_label": contract_label,
+                    "true_label": per_edge[j],
                     "pred_label": pred,
                     "prob_safe": prob[0],
                     "prob_vuln": prob[1],
                 })
 
     return compute_metrics(all_preds, all_labels, predictions)
+
+
+def compute_class_weights(train_data: list[dict], clamp: float = 10.0) -> torch.Tensor:
+    """
+    Compute CrossEntropyLoss class weights from the actual per-hyperedge
+    label distribution of the training set.
+
+    weight[1] = #neg / #pos, clamped to `clamp` to avoid blow-up when the
+    positive class is extremely rare (e.g. detectors flag very few sites).
+    weight[0] stays at 1.0.
+
+    Args:
+        train_data: list of contract dicts (from process_contract)
+        clamp: maximum value for the positive-class weight
+
+    Returns:
+        torch.Tensor shape (2,) on CPU
+    """
+    pos = 0
+    neg = 0
+    for c in train_data:
+        labels = c.get("labels")
+        if labels is None:
+            labels = [c["label"]] * c.get("n_hyperedges", 0)
+        for y in labels:
+            if y == 1:
+                pos += 1
+            else:
+                neg += 1
+
+    if pos == 0:
+        w1 = clamp
+    elif neg == 0:
+        w1 = clamp
+    else:
+        w1 = min(max(neg / pos, 1.0), clamp)
+
+    return torch.tensor([1.0, float(w1)], dtype=torch.float32)
 
 
 def compute_metrics(
@@ -342,7 +408,10 @@ def train_fold(
         use_layernorm=True,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.CrossEntropyLoss(weight=CLASS_WEIGHTS)
+    # Derive class weights from the actual per-hyperedge label distribution
+    # of this fold's training set (Section 7 revised).
+    class_weights = compute_class_weights(train_data)
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
     logger.info(
         f"Fold {fold_idx + 1} | seed={seed} | "
@@ -471,7 +540,15 @@ def _save_predictions_csv(predictions: list[dict], path: str) -> None:
     """Save per-hyperedge predictions to CSV."""
     if not predictions:
         return
-    keys = ["sol_path", "hyperedge_idx", "true_label", "pred_label", "prob_safe", "prob_vuln"]
+    keys = [
+        "sol_path",
+        "hyperedge_idx",
+        "contract_label",
+        "true_label",
+        "pred_label",
+        "prob_safe",
+        "prob_vuln",
+    ]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()

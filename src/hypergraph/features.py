@@ -20,7 +20,11 @@ VISIBILITY_CLASSES = ["public", "private", "internal", "external"]
 MUTABILITY_CLASSES = ["pure", "view", "payable", "nonpayable"]
 N_FUNC_FEATURES = len(VISIBILITY_CLASSES) + len(MUTABILITY_CLASSES) + 1  # 9
 
-# V_s features: type_category (8) + normalized_slot (1) + access_pattern (3) = 12
+# V_s features: type_category (8) + normalized_slot (1) + access_pattern (3)
+#   + written_after_call (1) + read_before_call (1) = 14
+# The last two flags are the reentrancy-specific extensions introduced to
+# surface the "write-after-external-call" / "read-before-external-call"
+# pattern directly to the model.
 TYPE_CATEGORIES = [
     "uint",       # uint256, uint8, int256, etc.
     "address",    # address
@@ -32,14 +36,37 @@ TYPE_CATEGORIES = [
     "other",      # anything else
 ]
 ACCESS_PATTERNS = ["read_only", "write_only", "read_write"]
-N_STATE_FEATURES = len(TYPE_CATEGORIES) + 1 + len(ACCESS_PATTERNS)  # 12
+N_STATE_FEATURES = (
+    len(TYPE_CATEGORIES)  # 8
+    + 1                   # normalized slot
+    + len(ACCESS_PATTERNS)  # 3
+    + 1                   # written_after_call (any call site in same function writes this after)
+    + 1                   # read_before_call
+)  # 14
 
-# V_c features: call_type_opcode (4) + value_transfer (1) = 5
+# V_c features: call_type_opcode (4) + value_transfer (1)
+#   + gas_forwarded (1) + sender_controlled_target (1) + guarded_by_modifier (1)
+#   + writes_after_call (1 count, log-normalized)
+#   + reads_after_call (1 count, log-normalized)
+#   + reads_before_call (1 count, log-normalized) = 11
+# These per-call-site fields carry the reentrancy pattern signal directly:
+# the defining reentrancy condition is a state write that occurs after an
+# attacker-influenceable external call that forwards gas, inside a function
+# that is not protected by a nonReentrant guard.
 CALL_OPCODES = ["call", "delegatecall", "staticcall", "other"]
-N_CALL_FEATURES = len(CALL_OPCODES) + 1  # 5
+N_CALL_FEATURES = (
+    len(CALL_OPCODES)  # 4
+    + 1                # value_transfer
+    + 1                # gas_forwarded
+    + 1                # sender_controlled_target
+    + 1                # guarded_by_modifier
+    + 1                # writes_after_call_count (log-normalized)
+    + 1                # reads_after_call_count (log-normalized)
+    + 1                # reads_before_call_count (log-normalized)
+)  # 11
 
 # Total feature dimension d (all padded to this)
-FEATURE_DIM = N_FUNC_FEATURES + N_STATE_FEATURES + N_CALL_FEATURES  # 26
+FEATURE_DIM = N_FUNC_FEATURES + N_STATE_FEATURES + N_CALL_FEATURES  # 34
 
 
 def build_feature_matrix(
@@ -85,6 +112,13 @@ def build_feature_matrix(
     # Compute access patterns for state vars from CFG
     access_patterns = _compute_access_patterns(cfg, state_vars)
 
+    # Compute per-var flags for the two reentrancy-specific V_s features by
+    # aggregating across all call sites in the contract: is this state var
+    # ever written *after* an external call, or read *before* one?
+    written_after_call, read_before_call = _compute_state_var_reentrancy_flags(
+        call_sites, state_vars
+    )
+
     # Compute max slot for normalization
     max_slot = max((v["slot"] for v in state_vars), default=1)
     if max_slot == 0:
@@ -100,7 +134,12 @@ def build_feature_matrix(
         elif node in set_s:
             var_name = node.replace("var:", "", 1)
             X[i] = _encode_state_var(
-                var_map.get(node), access_patterns.get(var_name, "read_write"), max_slot, FEATURE_DIM
+                var_map.get(node),
+                access_patterns.get(var_name, "read_write"),
+                max_slot,
+                FEATURE_DIM,
+                written_after_call=written_after_call.get(var_name, False),
+                read_before_call=read_before_call.get(var_name, False),
             )
         elif node in set_c:
             X[i] = _encode_call_site(cs_map.get(node), FEATURE_DIM)
@@ -128,11 +167,26 @@ def get_feature_config() -> dict:
             "size": N_STATE_FEATURES,
             "type_categories": TYPE_CATEGORIES,
             "access_patterns": ACCESS_PATTERNS,
+            "reentrancy_flags": [
+                "written_after_call",
+                "read_before_call",
+            ],
         },
         "call_site_features": {
             "offset": N_FUNC_FEATURES + N_STATE_FEATURES,
             "size": N_CALL_FEATURES,
             "call_opcodes": CALL_OPCODES,
+            "reentrancy_flags": [
+                "value_transfer",
+                "gas_forwarded",
+                "sender_controlled_target",
+                "guarded_by_modifier",
+            ],
+            "reentrancy_counts": [
+                "writes_after_call_count_log",
+                "reads_after_call_count_log",
+                "reads_before_call_count_log",
+            ],
         },
     }
 
@@ -204,11 +258,19 @@ def _classify_solidity_type(type_str: str) -> str:
 
 
 def _encode_state_var(
-    var: dict | None, access_pattern: str, max_slot: int, dim: int
+    var: dict | None,
+    access_pattern: str,
+    max_slot: int,
+    dim: int,
+    written_after_call: bool = False,
+    read_before_call: bool = False,
 ) -> np.ndarray:
     """
-    Encode a V_s node. Spec: Section 4.3 — V_s features.
-    Layout: [zeros(9) | type_category(8) | normalized_slot(1) | access_pattern(3) | zeros...]
+    Encode a V_s node. Spec: Section 4.3 — V_s features (extended).
+    Layout: [zeros(9)
+             | type_category(8) | normalized_slot(1) | access_pattern(3)
+             | written_after_call(1) | read_before_call(1)
+             | zeros...]
     """
     vec = np.zeros(dim, dtype=np.float32)
     if var is None:
@@ -229,14 +291,25 @@ def _encode_state_var(
     # Access pattern one-hot (3)
     ap = _one_hot(access_pattern, ACCESS_PATTERNS)
     vec[offset:offset + len(ap)] = ap
+    offset += len(ap)
+
+    # Reentrancy flags (2): is this state var ever written after an external
+    # call / read before one in the same function body. These carry the core
+    # reentrancy signal directly into the node features.
+    vec[offset] = 1.0 if written_after_call else 0.0
+    offset += 1
+    vec[offset] = 1.0 if read_before_call else 0.0
 
     return vec
 
 
 def _encode_call_site(cs: dict | None, dim: int) -> np.ndarray:
     """
-    Encode a V_c node. Spec: Section 4.3 — V_c features.
-    Layout: [zeros(21) | call_opcode(4) | value_transfer(1)]
+    Encode a V_c node. Spec: Section 4.3 — V_c features (extended).
+    Layout: [zeros(23)
+             | call_opcode(4) | value_transfer(1)
+             | gas_forwarded(1) | sender_controlled_target(1) | guarded_by_modifier(1)
+             | writes_after_call_count_log(1) | reads_after_call_count_log(1) | reads_before_call_count_log(1)]
     """
     vec = np.zeros(dim, dtype=np.float32)
     if cs is None:
@@ -254,8 +327,57 @@ def _encode_call_site(cs: dict | None, dim: int) -> np.ndarray:
 
     # Value transfer flag (1)
     vec[offset] = 1.0 if cs.get("has_value", False) else 0.0
+    offset += 1
+
+    # Reentrancy flags (3): gas forwarded (exploitable), sender-controlled
+    # target (attacker can trigger), guarded by a nonReentrant modifier.
+    vec[offset] = 1.0 if cs.get("gas_forwarded", False) else 0.0
+    offset += 1
+    vec[offset] = 1.0 if cs.get("sender_controlled_target", False) else 0.0
+    offset += 1
+    vec[offset] = 1.0 if cs.get("guarded_by_modifier", False) else 0.0
+    offset += 1
+
+    # Reentrancy pattern counts: #state vars written-after / read-after /
+    # read-before this specific call site. log1p-squashed so feature stays in
+    # a small range regardless of how many vars the function touches.
+    def _log_count(xs) -> float:
+        return float(np.log1p(len(xs or [])))
+
+    vec[offset] = _log_count(cs.get("writes_after_call"))
+    offset += 1
+    vec[offset] = _log_count(cs.get("reads_after_call"))
+    offset += 1
+    vec[offset] = _log_count(cs.get("reads_before_call"))
 
     return vec
+
+
+def _compute_state_var_reentrancy_flags(
+    call_sites: list[dict], state_vars: list[dict]
+) -> tuple[dict[str, bool], dict[str, bool]]:
+    """
+    Aggregate per-call-site reentrancy context up to state variables.
+
+    Returns:
+        (written_after_call, read_before_call): two dicts keyed by state var
+        name. A var is True in `written_after_call` if any call site has it in
+        its writes_after_call list, and True in `read_before_call` if any call
+        site has it in its reads_before_call list.
+    """
+    var_names = {v["name"] for v in state_vars}
+    written_after: dict[str, bool] = {v: False for v in var_names}
+    read_before: dict[str, bool] = {v: False for v in var_names}
+
+    for cs in call_sites:
+        for vn in cs.get("writes_after_call", []) or []:
+            if vn in var_names:
+                written_after[vn] = True
+        for vn in cs.get("reads_before_call", []) or []:
+            if vn in var_names:
+                read_before[vn] = True
+
+    return written_after, read_before
 
 
 def _compute_access_patterns(cfg: dict, state_vars: list[dict]) -> dict[str, str]:

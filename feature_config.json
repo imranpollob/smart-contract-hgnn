@@ -1,5 +1,5 @@
 {
-  "feature_dim": 26,
+  "feature_dim": 34,
   "func_features": {
     "offset": 0,
     "size": 9,
@@ -18,7 +18,7 @@
   },
   "state_var_features": {
     "offset": 9,
-    "size": 12,
+    "size": 14,
     "type_categories": [
       "uint",
       "address",
@@ -33,16 +33,31 @@
       "read_only",
       "write_only",
       "read_write"
+    ],
+    "reentrancy_flags": [
+      "written_after_call",
+      "read_before_call"
     ]
   },
   "call_site_features": {
-    "offset": 21,
-    "size": 5,
+    "offset": 23,
+    "size": 11,
     "call_opcodes": [
       "call",
       "delegatecall",
       "staticcall",
       "other"
+    ],
+    "reentrancy_flags": [
+      "value_transfer",
+      "gas_forwarded",
+      "sender_controlled_target",
+      "guarded_by_modifier"
+    ],
+    "reentrancy_counts": [
+      "writes_after_call_count_log",
+      "reads_after_call_count_log",
+      "reads_before_call_count_log"
     ]
   }
 }

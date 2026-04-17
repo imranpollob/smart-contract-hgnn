@@ -175,13 +175,21 @@ Compute feature vector `x_v ∈ R^d` for each node `v ∈ V` and assemble into m
 - `X: np.ndarray` of shape `(|V|, d)` — node feature matrix
 
 ### Feature Definitions (per node type)
-| Node type | Features |
-|---|---|
-| `V_f` (functions) | AST node type (one-hot), visibility (`public/private/internal/external`, one-hot), mutability (`pure/view/payable/nonpayable`, one-hot) |
-| `V_s` (state vars) | Variable type (one-hot over common Solidity types), storage slot index (normalized), access pattern (read-only / write-only / read-write, one-hot) |
-| `V_c` (call sites) | Call opcode (CALL / DELEGATECALL / STATICCALL, one-hot), value-transfer flag (0 or 1) |
+| Node type | Features | Width |
+|---|---|---|
+| `V_f` (functions) | visibility (one-hot, 4), mutability (one-hot, 4), `is_constructor` (1) | 9 |
+| `V_s` (state vars) | type category (one-hot, 8), normalized storage slot (1), access pattern (one-hot, 3), `written_after_call` (1), `read_before_call` (1) | 14 |
+| `V_c` (call sites) | call opcode (one-hot, 4), `value_transfer` (1), `gas_forwarded` (1), `sender_controlled_target` (1), `guarded_by_modifier` (1), log1p counts of `writes_after_call`, `reads_after_call`, `reads_before_call` (3) | 11 |
 
-- Pad all feature vectors to the same dimension `d` with zeros.
+The reentrancy-specific fields on `V_s` and `V_c` (Section 4.3 extended) carry
+the defining reentrancy pattern directly into node features: an external call
+that forwards gas, targets an attacker-influenceable address, is not guarded by
+a nonReentrant modifier, and is followed by a state write the attacker can
+exploit. These are computed once per contract in `src/extraction/ast_cfg.py`
+(`annotate_call_site_context` + IR inspection) and aggregated up to state vars
+by `_compute_state_var_reentrancy_flags` in `src/hypergraph/features.py`.
+
+- Pad all feature vectors to the same dimension `d = 34` with zeros.
 - Record `d` and the feature schema in a `feature_config.json` file for reproducibility.
 
 ### Verification Checklist
@@ -327,16 +335,32 @@ for fold in [1, 2, 3]:
 save metrics to results/fold_{fold}_metrics.csv
 ```
 
-### Label Assignment
-Labels are at the contract level (directory: `reentrant/` vs `safe/`).
-Map to hyperedge labels using the rule from spec Section 6.2:
-- For contracts in `reentrant/`: ALL hyperedges get `y_e = 1`
-- For contracts in `safe/`: ALL hyperedges get `y_e = 0`
+### Label Assignment (Section 6.2 revised — per call site)
+Labels come from two sources:
+1. **Directory-level**: a contract lives under `reentrant/` (label 1) or `safe/` (label 0).
+2. **Per-call-site**: for reentrant contracts, `src/extraction/labels.py`
+   re-runs Slither's reentrancy detectors (`reentrancy-eth`,
+   `reentrancy-no-eth`, `reentrancy-events`, `reentrancy-benign`) and assigns
+   `y_e = 1` **only** to call sites that a detector actually flags. The
+   remaining call sites in the same contract get `y_e = 0`.
+
+Policy:
+- Safe contracts → all hyperedges get `y_e = 0`.
+- Reentrant contract + Slither flags ≥1 site → flagged sites get 1, rest get 0.
+- Reentrant contract + Slither flags nothing (detector miss) → fall back to the
+  directory label (all 1). Losing a true positive is worse than light noise.
+
+This replaces the legacy contract-level smearing rule, which assigned
+the same label to every hyperedge in a contract regardless of which call site
+was actually vulnerable.
 
 ### Class Weights
-- Reentrant (class 1) weight = `314 / 122 ≈ 2.57`
-- Safe (class 0) weight = `1.0`
-- Pass as `weight` argument to `nn.CrossEntropyLoss`
+Per-fold, computed from the actual per-hyperedge label distribution of the
+training set (`compute_class_weights` in `src/evaluation/train.py`):
+`weight[1] = min(#neg / #pos, clamp)` with `clamp=10.0`; `weight[0] = 1.0`.
+The old contract-level 1:2.57 ratio no longer matches the true positive rate
+once labels are per call site. Pass the resulting tensor as `weight=` to
+`nn.CrossEntropyLoss`.
 
 ### Metrics to Compute and Save
 - Precision (vulnerable class)
