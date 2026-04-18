@@ -14,6 +14,7 @@ from src.evaluation.train import (
     CLASS_WEIGHTS,
     REENTRANT_DIR,
     SAFE_DIR,
+    _collect_probs_and_labels,
     compute_class_weights,
     compute_metrics,
     evaluate,
@@ -21,6 +22,7 @@ from src.evaluation.train import (
     process_contract,
     train_epoch,
     train_fold,
+    tune_threshold,
 )
 from src.hypergraph.features import FEATURE_DIM
 from src.model.hgnn import HGNN
@@ -316,3 +318,173 @@ class TestTrainFold:
             # Check predictions CSV was saved
             pred_files = [f for f in os.listdir(tmpdir) if f.endswith(".csv")]
             assert len(pred_files) > 0
+
+    def test_train_fold_with_focal_loss(self):
+        """Step 3: train_fold should accept loss_type='focal' and train."""
+        data = process_contract(WITHDRAW_SOL, label=1)
+        assert data is not None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metrics = train_fold(
+                fold_idx=0,
+                train_data=[data],
+                val_data=[data],
+                seed=42,
+                epochs=5,
+                dropout=0.3,
+                weight_decay=1e-4,
+                loss_type="focal",
+                focal_gamma=2.0,
+                results_dir=tmpdir,
+            )
+            assert "f1" in metrics
+            assert len(metrics["loss_history"]) == 5
+
+    def test_train_fold_rejects_unknown_loss(self):
+        data = process_contract(WITHDRAW_SOL, label=1)
+        assert data is not None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="Unknown loss_type"):
+                train_fold(
+                    fold_idx=0,
+                    train_data=[data],
+                    val_data=[data],
+                    seed=42,
+                    epochs=1,
+                    loss_type="hinge",
+                    results_dir=tmpdir,
+                )
+
+    def test_train_fold_reports_threshold_diagnostics(self):
+        """Val eval uses threshold=0.5; the train-optimal threshold is
+        recorded separately as a diagnostic. (Train-based threshold tuning
+        regressed val F1 on 2026-04-17 — see tune_threshold docstring.)"""
+        data = process_contract(WITHDRAW_SOL, label=1)
+        assert data is not None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metrics = train_fold(
+                fold_idx=0,
+                train_data=[data],
+                val_data=[data],
+                seed=42,
+                epochs=5,
+                results_dir=tmpdir,
+            )
+            # Applied threshold for val is always 0.5 (default of evaluate).
+            assert metrics["threshold"] == 0.5
+            # Diagnostic: train-sweep result is still surfaced.
+            assert "train_opt_threshold" in metrics
+            assert 0.10 <= metrics["train_opt_threshold"] <= 0.90
+            assert "train_opt_f1" in metrics
+
+
+# ── Threshold Tuning Tests (Step 2) ────────────────────────────────
+
+
+class _StubTwoClassModel(torch.nn.Module):
+    """Deterministic fake model: returns a fixed prob_vuln for each hyperedge.
+
+    Lets us test threshold sweeps without training — the contract dict carries
+    a custom "probs" key that process_contract would never write.
+    """
+
+    def __init__(self, probs_per_contract):
+        super().__init__()
+        self._probs = probs_per_contract
+        self._i = 0
+
+    def reset(self):
+        self._i = 0
+
+    def forward(self, X, H_inc, E, node_index):
+        probs = self._probs[self._i]
+        self._i += 1
+        p = torch.tensor(probs, dtype=torch.float32)
+        return torch.stack([1 - p, p], dim=1)
+
+
+def _make_fake_contract(n_edges, labels, sol_path="/fake.sol"):
+    return {
+        "X": np.zeros((1, FEATURE_DIM), dtype=np.float32),
+        "H_inc": np.zeros((1, n_edges), dtype=np.float32),
+        "E": [set() for _ in range(n_edges)],
+        "node_index": {},
+        "label": 1 if any(labels) else 0,
+        "labels": list(labels),
+        "n_hyperedges": n_edges,
+        "sol_path": sol_path,
+    }
+
+
+class TestEvaluateThreshold:
+    """evaluate() should honor the `threshold` arg and record it in metrics."""
+
+    def test_default_threshold_matches_argmax(self):
+        # prob_vuln = 0.6 → at t=0.5 both hyperedges predicted 1.
+        model = _StubTwoClassModel([[0.6, 0.6]])
+        contract = _make_fake_contract(2, labels=[1, 1])
+        m = evaluate(model, [contract])
+        assert m["threshold"] == 0.5
+        assert m["tp"] == 2
+        assert m["fn"] == 0
+
+    def test_higher_threshold_reduces_positives(self):
+        # prob_vuln = 0.6. t=0.5 predicts vuln; t=0.7 predicts safe.
+        model = _StubTwoClassModel([[0.6, 0.6]])
+        contract = _make_fake_contract(2, labels=[1, 1])
+        m = evaluate(model, [contract], threshold=0.7)
+        assert m["threshold"] == 0.7
+        assert m["tp"] == 0
+        assert m["fn"] == 2
+
+    def test_lower_threshold_boosts_recall(self):
+        # prob_vuln = 0.3. t=0.5 misses; t=0.2 catches.
+        contract = _make_fake_contract(2, labels=[1, 1])
+
+        model_a = _StubTwoClassModel([[0.3, 0.3]])
+        m_high = evaluate(model_a, [contract], threshold=0.5)
+        assert m_high["recall"] == 0.0
+
+        model_b = _StubTwoClassModel([[0.3, 0.3]])
+        m_low = evaluate(model_b, [contract], threshold=0.2)
+        assert m_low["recall"] == 1.0
+
+
+class TestTuneThreshold:
+    """tune_threshold picks the F1-max threshold on the training set."""
+
+    def test_picks_threshold_that_captures_true_positive(self):
+        # Two hyperedges, both labeled 1. Probs 0.3 and 0.8.
+        # t=0.5: recall=0.5; t=0.25: recall=1.0, precision=1.0, F1=1.0.
+        model = _StubTwoClassModel([[0.3, 0.8]])
+        contract = _make_fake_contract(2, labels=[1, 1])
+        t, f1 = tune_threshold(model, [contract])
+        assert f1 == pytest.approx(1.0)
+        assert t <= 0.35
+
+    def test_tie_break_prefers_threshold_near_half(self):
+        # All labels 0 → F1 is always 0 regardless of threshold → ties across
+        # the sweep. Tie-break should snap to t closest to 0.5.
+        model = _StubTwoClassModel([[0.1, 0.9]])
+        contract = _make_fake_contract(2, labels=[0, 0])
+        t, f1 = tune_threshold(model, [contract])
+        assert f1 == 0.0
+        assert t == pytest.approx(0.5)
+
+    def test_empty_data_returns_half(self):
+        model = _StubTwoClassModel([])
+        t, f1 = tune_threshold(model, [])
+        assert t == 0.5
+        assert f1 == 0.0
+
+    def test_collect_probs_and_labels_shapes(self):
+        model = _StubTwoClassModel([[0.1, 0.9], [0.5]])
+        contracts = [
+            _make_fake_contract(2, labels=[0, 1]),
+            _make_fake_contract(1, labels=[1]),
+        ]
+        probs, labels = _collect_probs_and_labels(model, contracts)
+        assert probs.shape == (3,)
+        assert labels.tolist() == [0, 1, 1]

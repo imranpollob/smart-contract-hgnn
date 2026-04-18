@@ -22,6 +22,7 @@ from src.hypergraph.features import FEATURE_DIM, build_feature_matrix
 from src.hypergraph.hyperedges import build_hyperedges
 from src.hypergraph.nodeset import build_node_sets
 from src.model.hgnn import HGNN
+from src.model.losses import FocalLoss
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,10 @@ DEFAULT_EPOCHS = 50
 DEFAULT_LR = 1e-3
 DEFAULT_HIDDEN_DIM = 64
 DEFAULT_N_LAYERS = 2
+DEFAULT_DROPOUT = 0.0
+DEFAULT_WEIGHT_DECAY = 0.0
+DEFAULT_LOSS_TYPE = "ce"  # "ce" | "focal"
+DEFAULT_FOCAL_GAMMA = 2.0
 
 # Fallback class weights for ad-hoc test runs that never see a full fold. The
 # production pipeline computes weights from the actual per-hyperedge label
@@ -187,6 +192,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     loss_fn: nn.CrossEntropyLoss,
     train_data: list[dict],
+    grad_clip: float | None = 1.0,
 ) -> float:
     """
     Train one epoch over all contracts.
@@ -194,6 +200,11 @@ def train_epoch(
 
     Uses per-hyperedge labels (Section 6.2 revised): only call sites flagged
     by Slither's reentrancy detectors are labeled 1 in reentrant contracts.
+
+    Args:
+        grad_clip: if not None, clip gradient L2 norm to this value before
+            stepping the optimizer. Prevents late-epoch loss blow-ups observed
+            on a few outlier contracts (kept at 1.0 by default).
 
     Returns:
         Average loss over all hyperedges in the epoch.
@@ -221,6 +232,8 @@ def train_epoch(
 
         optimizer.zero_grad()
         loss.backward()
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
 
         total_loss += loss.item() * n_edges
@@ -232,6 +245,7 @@ def train_epoch(
 def evaluate(
     model: HGNN,
     val_data: list[dict],
+    threshold: float = 0.5,
 ) -> dict:
     """
     Evaluate model on validation data.
@@ -239,6 +253,12 @@ def evaluate(
 
     Metrics are computed against the per-hyperedge labels written by
     process_contract (Section 6.2 revised).
+
+    Args:
+        threshold: a hyperedge is predicted vulnerable iff prob_vuln >= threshold.
+            At 0.5 this is equivalent to argmax over the 2 softmax outputs
+            (current default). Lower values trade precision for recall; the
+            per-fold optimum is picked by tune_threshold on train data.
 
     Returns:
         dict with metrics: precision, recall, f1, fnr, fpr, accuracy,
@@ -263,7 +283,8 @@ def evaluate(
                 per_edge = [contract_label] * n_edges
 
             y_pred = model(X, H_inc, E, node_index)
-            pred_labels = y_pred.argmax(dim=1).tolist()
+            prob_vuln = y_pred[:, 1]
+            pred_labels = (prob_vuln >= threshold).long().tolist()
 
             all_preds.extend(pred_labels)
             all_labels.extend(per_edge)
@@ -279,7 +300,86 @@ def evaluate(
                     "prob_vuln": prob[1],
                 })
 
-    return compute_metrics(all_preds, all_labels, predictions)
+    metrics = compute_metrics(all_preds, all_labels, predictions)
+    metrics["threshold"] = float(threshold)
+    return metrics
+
+
+def _collect_probs_and_labels(
+    model: HGNN, data: list[dict], device: torch.device | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run the model once over `data` and return (prob_vuln, per-hyperedge labels)."""
+    model.eval()
+    probs = []
+    labels = []
+    with torch.no_grad():
+        for contract in data:
+            X = torch.tensor(contract["X"], dtype=torch.float32)
+            H_inc = torch.tensor(contract["H_inc"], dtype=torch.float32)
+            if device is not None:
+                X = X.to(device)
+                H_inc = H_inc.to(device)
+            E = contract["E"]
+            node_index = contract["node_index"]
+            n_edges = contract["n_hyperedges"]
+
+            per_edge = contract.get("labels")
+            if per_edge is None:
+                per_edge = [contract["label"]] * n_edges
+
+            y_pred = model(X, H_inc, E, node_index)
+            probs.extend(y_pred[:, 1].detach().cpu().tolist())
+            labels.extend(per_edge)
+
+    return np.asarray(probs, dtype=np.float64), np.asarray(labels, dtype=np.int64)
+
+
+def tune_threshold(
+    model: HGNN,
+    train_data: list[dict],
+    thresholds: np.ndarray | None = None,
+    device: torch.device | None = None,
+) -> tuple[float, float]:
+    """
+    Pick the decision threshold that maximizes F1 on the training set.
+
+    Run on *train* data only to avoid leaking val information — best_state
+    was already selected using val F1@0.5, so tuning the threshold on val too
+    would double-dip. Train/val share the same distribution, so the picked
+    threshold transfers.
+
+    Tie-break: if several thresholds tie on F1, prefer the one closest to 0.5
+    (most conservative choice).
+
+    Returns:
+        (best_threshold, best_train_f1)
+    """
+    if thresholds is None:
+        # 0.10, 0.15, ..., 0.90
+        thresholds = np.arange(0.10, 0.91, 0.05)
+
+    probs, labels = _collect_probs_and_labels(model, train_data, device=device)
+    if probs.size == 0:
+        return 0.5, 0.0
+
+    best_f1 = -1.0
+    best_t = 0.5
+    best_dist = float("inf")
+    for t in thresholds:
+        preds = (probs >= t).astype(np.int64)
+        tp = int(((preds == 1) & (labels == 1)).sum())
+        fp = int(((preds == 1) & (labels == 0)).sum())
+        fn = int(((preds == 0) & (labels == 1)).sum())
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        dist = abs(t - 0.5)
+        if f1 > best_f1 or (f1 == best_f1 and dist < best_dist):
+            best_f1 = f1
+            best_t = float(t)
+            best_dist = dist
+
+    return best_t, float(best_f1)
 
 
 def compute_class_weights(train_data: list[dict], clamp: float = 10.0) -> torch.Tensor:
@@ -377,6 +477,10 @@ def train_fold(
     lr: float = DEFAULT_LR,
     hidden_dim: int = DEFAULT_HIDDEN_DIM,
     n_layers: int = DEFAULT_N_LAYERS,
+    dropout: float = DEFAULT_DROPOUT,
+    weight_decay: float = DEFAULT_WEIGHT_DECAY,
+    loss_type: str = DEFAULT_LOSS_TYPE,
+    focal_gamma: float = DEFAULT_FOCAL_GAMMA,
     results_dir: str = "results",
 ) -> dict:
     """
@@ -392,6 +496,12 @@ def train_fold(
         lr: learning rate
         hidden_dim: HGNN hidden dimension
         n_layers: number of HGNN layers
+        dropout: dropout applied inside each HGNN layer; Step 3 raises this
+            from 0.0 to close the train/val F1 gap.
+        weight_decay: L2 regularization on Adam (Step 3).
+        loss_type: "ce" for weighted CrossEntropy (default) or "focal" for
+            focal loss with per-class α derived from compute_class_weights.
+        focal_gamma: focusing parameter when loss_type="focal".
         results_dir: directory to save results
 
     Returns:
@@ -406,48 +516,83 @@ def train_fold(
         hidden_dim=hidden_dim,
         n_layers=n_layers,
         use_layernorm=True,
+        dropout=dropout,
     )
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     # Derive class weights from the actual per-hyperedge label distribution
     # of this fold's training set (Section 7 revised).
     class_weights = compute_class_weights(train_data)
-    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+    if loss_type == "focal":
+        loss_fn = FocalLoss(gamma=focal_gamma, weight=class_weights)
+    elif loss_type == "ce":
+        loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type!r} (want 'ce' or 'focal')")
 
     logger.info(
         f"Fold {fold_idx + 1} | seed={seed} | "
         f"train={len(train_data)} contracts | val={len(val_data)} contracts"
     )
 
-    best_f1 = 0.0
-    best_metrics = None
+    # Track best state by F1 (tie-break on lower training loss). Final fold
+    # metrics come from this best state, not from the last-epoch weights —
+    # otherwise a late-epoch collapse (seen on seed 42 / fold 2) wipes out an
+    # earlier good run.
+    best_f1 = -1.0
+    best_loss_at_best = float("inf")
+    best_state = None
     loss_history = []
 
     for epoch in range(epochs):
         avg_loss = train_epoch(model, optimizer, loss_fn, train_data)
         loss_history.append(avg_loss)
 
+        # Evaluate every epoch so best_state can be selected from the true
+        # best epoch, not from a sparse snapshot.
+        metrics = evaluate(model, val_data)
+
         if (epoch + 1) % 10 == 0 or epoch == 0 or epoch == epochs - 1:
-            metrics = evaluate(model, val_data)
             logger.info(
                 f"  Epoch {epoch + 1:3d} | loss={avg_loss:.4f} | "
                 f"P={metrics['precision']:.3f} R={metrics['recall']:.3f} "
                 f"F1={metrics['f1']:.3f} FNR={metrics['fnr']:.3f} FPR={metrics['fpr']:.3f}"
             )
-            if metrics["f1"] >= best_f1:
-                best_f1 = metrics["f1"]
-                best_metrics = metrics
 
-                # Save best checkpoint
-                os.makedirs("checkpoints", exist_ok=True)
-                ckpt_path = os.path.join(
-                    "checkpoints", f"hgnn_fold{fold_idx + 1}_seed{seed}.pt"
-                )
-                torch.save(model.state_dict(), ckpt_path)
+        # Strictly-better F1, or same F1 with lower training loss.
+        is_better = metrics["f1"] > best_f1 or (
+            metrics["f1"] == best_f1 and avg_loss < best_loss_at_best
+        )
+        if is_better:
+            best_f1 = metrics["f1"]
+            best_loss_at_best = avg_loss
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-    # Final evaluation
+    # Load best state before final evaluation so the fold result reflects
+    # the best epoch, not the last one.
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # Diagnostic only: what threshold *would* the train set pick? Logged so
+    # the calibration gap (train F1 >> val F1) is visible, but NOT applied
+    # to val — the 2026-04-17 sweep showed train-optimal thresholds (0.10–
+    # 0.30) regress val F1 because the overfit model's probabilities are
+    # poorly calibrated. Threshold tuning is deferred until loss-level
+    # regularization (Step 3, focal loss + dropout/L2) closes that gap.
+    train_opt_t, train_opt_f1 = tune_threshold(model, train_data)
+    logger.info(
+        f"  [diagnostic] train-optimal threshold: t={train_opt_t:.2f} "
+        f"(train F1={train_opt_f1:.3f}); val eval uses t=0.5"
+    )
+
+    # Save best checkpoint and final evaluation.
+    os.makedirs("checkpoints", exist_ok=True)
+    ckpt_path = os.path.join(
+        "checkpoints", f"hgnn_fold{fold_idx + 1}_seed{seed}.pt"
+    )
+    torch.save(model.state_dict(), ckpt_path)
+
     final_metrics = evaluate(model, val_data)
 
-    # Save per-hyperedge predictions
     os.makedirs(results_dir, exist_ok=True)
     pred_path = os.path.join(
         results_dir, f"fold{fold_idx + 1}_seed{seed}_predictions.csv"
@@ -455,6 +600,8 @@ def train_fold(
     _save_predictions_csv(final_metrics["predictions"], pred_path)
 
     final_metrics["loss_history"] = loss_history
+    final_metrics["train_opt_threshold"] = train_opt_t
+    final_metrics["train_opt_f1"] = train_opt_f1
     return final_metrics
 
 
@@ -465,6 +612,10 @@ def run_cv(
     lr: float = DEFAULT_LR,
     hidden_dim: int = DEFAULT_HIDDEN_DIM,
     n_layers: int = DEFAULT_N_LAYERS,
+    dropout: float = DEFAULT_DROPOUT,
+    weight_decay: float = DEFAULT_WEIGHT_DECAY,
+    loss_type: str = DEFAULT_LOSS_TYPE,
+    focal_gamma: float = DEFAULT_FOCAL_GAMMA,
     results_dir: str = "results",
 ) -> dict:
     """
@@ -522,6 +673,10 @@ def run_cv(
                 lr=lr,
                 hidden_dim=hidden_dim,
                 n_layers=n_layers,
+                dropout=dropout,
+                weight_decay=weight_decay,
+                loss_type=loss_type,
+                focal_gamma=focal_gamma,
                 results_dir=results_dir,
             )
             seed_metrics.append(metrics)
@@ -582,16 +737,21 @@ def _aggregate_results(all_results: list[dict], results_dir: str) -> dict:
         for m in metric_names:
             writer.writerow([m, f"{summary[f'{m}_mean']:.4f}", f"{summary[f'{m}_std']:.4f}"])
 
-    # Save per-fold-per-seed metrics
+    # Save per-fold-per-seed metrics. train_opt_threshold is diagnostic only
+    # (what the F1-max sweep on train data would have picked); the applied
+    # threshold for val is always 0.5 until regularization closes the
+    # train/val calibration gap.
     detail_path = os.path.join(results_dir, "cv_detailed.csv")
     with open(detail_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["seed", "fold", *metric_names])
+        writer.writerow(["seed", "fold", *metric_names, "threshold", "train_opt_threshold"])
         for result in all_results:
             seed = result["seed"]
             for fold_idx, fold_metrics in enumerate(result["fold_metrics"]):
                 row = [seed, fold_idx + 1]
                 row.extend(f"{fold_metrics[m]:.4f}" for m in metric_names)
+                row.append(f"{fold_metrics.get('threshold', 0.5):.2f}")
+                row.append(f"{fold_metrics.get('train_opt_threshold', 0.5):.2f}")
                 writer.writerow(row)
 
     logger.info(f"\nCV Summary (mean ± std across {len(all_results)} seeds x folds):")
@@ -618,6 +778,12 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--hidden-dim", type=int, default=DEFAULT_HIDDEN_DIM)
     parser.add_argument("--n-layers", type=int, default=DEFAULT_N_LAYERS)
+    parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
+    parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
+    parser.add_argument(
+        "--loss-type", choices=["ce", "focal"], default=DEFAULT_LOSS_TYPE
+    )
+    parser.add_argument("--focal-gamma", type=float, default=DEFAULT_FOCAL_GAMMA)
     parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS)
     parser.add_argument("--results-dir", type=str, default="results")
     args = parser.parse_args()
@@ -628,5 +794,9 @@ if __name__ == "__main__":
         lr=args.lr,
         hidden_dim=args.hidden_dim,
         n_layers=args.n_layers,
+        dropout=args.dropout,
+        weight_decay=args.weight_decay,
+        loss_type=args.loss_type,
+        focal_gamma=args.focal_gamma,
         results_dir=args.results_dir,
     )
